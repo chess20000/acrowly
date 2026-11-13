@@ -1,4 +1,7 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   currentActor,
   registerShellPid,
@@ -17,23 +20,84 @@ const BACKGROUND_TIMEOUT_DEFAULT_MS = 30 * 60_000;
 interface LiveJob {
   pid: number;
   timer: NodeJS.Timeout;
+  child: ChildProcess;
 }
 
 const liveJobs = new Set<LiveJob>();
+const liveChildren = new Set<ChildProcess>();
 
-export function stopTrackedShells(): void {
-  for (const job of liveJobs) {
-    clearTimeout(job.timer);
+function taskkillExe(): string {
+  const root = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  return path.join(root, "System32", "taskkill.exe");
+}
+
+function closeChildStreams(child: ChildProcess): void {
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+  child.stdin?.destroy();
+}
+
+function trackChild(child: ChildProcess): void {
+  liveChildren.add(child);
+  const release = (): void => {
+    liveChildren.delete(child);
+    closeChildStreams(child);
+  };
+  child.once("exit", release);
+  child.once("error", release);
+}
+
+function waitForExit(child: ChildProcess, timeoutMs = 8000): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+/** Kill pid and every process it started. taskkill /T is synchronous and waits. */
+export function killProcessTreeSync(pid: number | undefined): void {
+  if (!pid || pid <= 0) return;
+  if (process.platform === "win32") {
     try {
-      process.kill(-job.pid, "SIGTERM");
+      execFileSync(taskkillExe(), ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+        timeout: 8000,
+      });
     } catch {
       try {
-        process.kill(job.pid, "SIGTERM");
+        process.kill(pid);
       } catch {
         // already gone
       }
     }
+    return;
   }
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+  }
+}
+
+export async function stopTrackedShells(): Promise<void> {
+  for (const job of liveJobs) clearTimeout(job.timer);
+  const pending = [...liveChildren];
+  for (const child of pending) {
+    if (child.exitCode === null && child.signalCode === null) {
+      killProcessTreeSync(child.pid);
+    }
+  }
+  await Promise.all(pending.map((child) => waitForExit(child)));
+  for (const child of pending) closeChildStreams(child);
   liveJobs.clear();
 }
 
@@ -43,21 +107,91 @@ export interface ShellRunResult {
   background: boolean;
 }
 
-function shellBin(): string {
-  return process.platform === "win32" ? "powershell.exe" : "/bin/sh";
+function powershellExe(): string {
+  const root = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  return path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+/**
+ * Windows PowerShell strips unescaped `"` from `-Command` before the script runs,
+ * which turns `node -e "fetch(...)"` into a syntax error so the loopback post
+ * never happens. `-EncodedCommand` is the UTF-16LE script with quoting intact.
+ * Non-ASCII native arguments are still lossy in Windows PowerShell 5.1 when
+ * there is no console; callers that must round-trip Unicode should keep the
+ * command ASCII (for example base64) and let Node decode it.
+ */
+export function encodePowerShellCommand(command: string): string {
+  const script = [
+    "try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}",
+    "$OutputEncoding = New-Object System.Text.UTF8Encoding $false",
+    command,
+    "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }",
+  ].join("\r\n");
+  return Buffer.from(script, "utf16le").toString("base64");
+}
+
+function spawnShell(command: string, options: SpawnOptions): ChildProcess {
+  if (process.platform === "win32") {
+    return spawn(
+      powershellExe(),
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encodePowerShellCommand(command),
+      ],
+      { ...options, windowsHide: true }
+    );
+  }
+  return spawn("/bin/sh", ["-c", command], options);
+}
+
+const ACTOR_PRELOAD_SOURCE = `
+const token = process.env.ACROWLY_ACTOR_TOKEN;
+if (token && typeof global.fetch === "function") {
+  const orig = global.fetch;
+  global.fetch = function (input, init) {
+    try {
+      const url = typeof input === "string" ? input : (input && input.url) || "";
+      const method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
+      if (method === "POST" && String(url).includes("/api/chat/messages")) {
+        const headers = new Headers((init && init.headers) || (typeof Request !== "undefined" && input instanceof Request ? input.headers : undefined));
+        if (!headers.has("x-acrowly-actor")) headers.set("x-acrowly-actor", token);
+        init = Object.assign({}, init, { headers });
+      }
+    } catch (err) {
+      // Never block the command if tagging fails.
+    }
+    return orig.apply(this, [input, init]);
+  };
+}
+`;
+
+let actorPreloadPath: string | undefined;
+
+function ensureActorPreload(): string {
+  if (actorPreloadPath) return actorPreloadPath;
+  actorPreloadPath = path.join(os.tmpdir(), "acrowly-actor-preload.cjs");
+  fs.writeFileSync(actorPreloadPath, ACTOR_PRELOAD_SOURCE, "utf8");
+  return actorPreloadPath;
 }
 
 function actorEnv(actor: ActorIdentity | undefined): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    ...(actor
-      ? {
-          ACROWLY_ACTOR_TOKEN: actor.token,
-          ACROWLY_ACTOR_ORIGIN: actor.kind,
-          ACROWLY_ACTOR_LABEL: actor.label,
-        }
-      : {}),
-  };
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (!actor) return env;
+  env.ACROWLY_ACTOR_TOKEN = actor.token;
+  env.ACROWLY_ACTOR_ORIGIN = actor.kind;
+  env.ACROWLY_ACTOR_LABEL = actor.label;
+  // Windows cannot read another process's environment. Child `node` still
+  // inherits this and --require tags loopback chat posts with the actor token.
+  // NODE_OPTIONS treats backslash as an escape, so Windows paths must use /.
+  const preload = ensureActorPreload().replace(/\\/g, "/");
+  const quoted = preload.includes(" ") ? `"${preload}"` : preload;
+  const prev = env.NODE_OPTIONS?.trim();
+  env.NODE_OPTIONS = [prev, `--require ${quoted}`].filter(Boolean).join(" ");
+  return env;
 }
 
 /** `cmd &` is a detached waiter. `cmd &&` is not. */
@@ -70,16 +204,7 @@ export function splitBackgroundCommand(command: string): { background: boolean; 
 }
 
 function killGroup(child: ChildProcess): void {
-  if (!child.pid) return;
-  try {
-    process.kill(-child.pid, "SIGTERM");
-  } catch {
-    try {
-      child.kill("SIGTERM");
-    } catch {
-      // already gone
-    }
-  }
+  killProcessTreeSync(child.pid);
 }
 
 function formatStreams(stdout: string, stderr: string, exitCode: number, timedOut: boolean): string {
@@ -148,8 +273,7 @@ function startBackground(options: {
 }): string {
   const label = options.actor?.label || "shell";
   if (options.actor) retainActor(options.actor);
-  const child = spawn(options.command, {
-    shell: shellBin(),
+  const child = spawnShell(options.command, {
     cwd: options.cwd,
     env: actorEnv(options.actor),
     detached: process.platform !== "win32",
@@ -157,15 +281,23 @@ function startBackground(options: {
     windowsHide: true,
   });
   if (child.pid && options.actor) registerShellPid(child.pid, options.actor);
+  trackChild(child);
 
   let settled = false;
-  const job: LiveJob = { pid: child.pid ?? -1, timer: undefined as unknown as NodeJS.Timeout };
+  let killedByTimeout = false;
+  const job: LiveJob = {
+    pid: child.pid ?? -1,
+    timer: undefined as unknown as NodeJS.Timeout,
+    child,
+  };
+  const timeoutText = formatUserVisibleReply(`后台 ${label} 到时限结束，没有完成，也没有外部回执。`);
   const finish = (text: string): void => {
     if (settled) return;
     settled = true;
     clearTimeout(job.timer);
     liveJobs.delete(job);
     if (child.pid) unregisterShellPid(child.pid);
+    closeChildStreams(child);
     if (options.actor) releaseActor(options.actor);
     if (options.onSettled) {
       void options.onSettled(text).catch(() => {});
@@ -173,8 +305,9 @@ function startBackground(options: {
   };
 
   job.timer = setTimeout(() => {
+    killedByTimeout = true;
     killGroup(child);
-    finish(formatUserVisibleReply(`后台 ${label} 到时限结束，没有完成，也没有外部回执。`));
+    finish(timeoutText);
   }, options.timeoutMs);
   if (child.pid) liveJobs.add(job);
 
@@ -183,8 +316,8 @@ function startBackground(options: {
   });
   child.on("exit", (code, signal) => {
     if (settled) return;
-    if (signal) {
-      finish(formatUserVisibleReply(`后台 ${label} 到时限结束，没有完成，也没有外部回执。`));
+    if (killedByTimeout || signal) {
+      finish(timeoutText);
       return;
     }
     if (code === 0) {
@@ -214,8 +347,7 @@ function runForeground(options: {
       reject(new Error("Aborted"));
       return;
     }
-    const child = spawn(options.command, {
-      shell: shellBin(),
+    const child = spawnShell(options.command, {
       cwd: options.cwd,
       env: actorEnv(options.actor),
       detached: process.platform !== "win32",
@@ -223,6 +355,7 @@ function runForeground(options: {
       windowsHide: true,
     });
     if (child.pid && options.actor) registerShellPid(child.pid, options.actor);
+    trackChild(child);
 
     let stdout = "";
     let stderr = "";
@@ -233,6 +366,7 @@ function runForeground(options: {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", onAbort);
       if (child.pid) unregisterShellPid(child.pid);
+      closeChildStreams(child);
     };
 
     const finish = (exitCode: number): void => {

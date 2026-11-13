@@ -4,13 +4,14 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { actorForProcessTree, parseNetstatPid, type ActorIdentity } from "../agent/actor.js";
 import {
   formatUserVisibleReply,
   reviewCoordinatorReply,
   stripCoordinatorMarkdown,
   UNVERIFIED_FALLBACK,
 } from "../agent/reply-policy.js";
-import { splitBackgroundCommand } from "../agent/shell-runner.js";
+import { encodePowerShellCommand, splitBackgroundCommand } from "../agent/shell-runner.js";
 import { createAcrowlyDaemon } from "../runtime.js";
 import type { ChatMessage } from "../types.js";
 
@@ -19,7 +20,7 @@ async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   try {
     await fn(dir);
   } finally {
-    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 
@@ -109,6 +110,31 @@ test("reply policy strips tables, caps length, and blocks unverified success", (
     background: false,
     command: "npm test && npm run build",
   });
+
+  const script = `node -e "fetch(process.env.ACROWLY_LOCAL_ORIGIN+'/api/chat/messages')"`;
+  const decoded = Buffer.from(encodePowerShellCommand(script), "base64").toString("utf16le");
+  assert.match(decoded, /node -e "fetch\(process\.env\.ACROWLY_LOCAL_ORIGIN\+'\/api\/chat\/messages'\)"/);
+  assert.match(decoded, /LASTEXITCODE/);
+
+  const netstat = [
+    "  Proto  Local Address          Foreign Address        State           PID",
+    "  TCP    127.0.0.1:52431        127.0.0.1:8787         ESTABLISHED     4321",
+    "  TCP    127.0.0.1:8787         127.0.0.1:52431        HERGESTELLT     1111",
+    "  TCP    [::1]:52431            [::1]:8787             ESTABLISHED     4321",
+  ].join("\r\n");
+  assert.equal(parseNetstatPid(netstat, 52431), 4321);
+  assert.equal(parseNetstatPid(netstat, 8787), 1111);
+  assert.equal(parseNetstatPid(netstat, 9), undefined);
+
+  const actor = { kind: "subagent", id: "sub", label: "grok-test", token: "t", refs: 1 } as ActorIdentity;
+  const shells = new Map<number, ActorIdentity>([[10, actor]]);
+  const ppids = new Map<number, number>([
+    [30, 20],
+    [20, 10],
+    [10, 1],
+  ]);
+  assert.equal(actorForProcessTree(30, ppids, shells)?.label, "grok-test");
+  assert.equal(actorForProcessTree(99, ppids, shells), undefined);
 });
 
 test("subagent loopback self-test is not a user message and cannot confirm connectivity", async () => {
@@ -136,8 +162,13 @@ test("subagent loopback self-test is not a user message and cannot confirm conne
         let reply: unknown;
         if (sys.includes("执行型子代理")) {
           if (last?.role === "user") {
-            const command =
-              `node -e 'fetch(process.env.ACROWLY_LOCAL_ORIGIN+"/api/chat/messages",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({text:"【来自 Grok Bot 的测试】收到了你的消息"})}).then(async r=>{console.log(await r.text());process.exit(0);}).catch(e=>{console.error(e);process.exit(1);})'`;
+            // ASCII command: Windows PowerShell 5.1 re-encodes native argv with the
+            // OEM code page when there is no console, so a Chinese literal inside
+            // `node -e` would be stored as "???" and this assertion would miss it.
+            // Base64 keeps the shell post identical on Linux sh and Windows PowerShell.
+            const payload = "【来自 Grok Bot 的测试】收到了你的消息";
+            const b64 = Buffer.from(payload, "utf8").toString("base64");
+            const command = `node -e "fetch(process.env.ACROWLY_LOCAL_ORIGIN+'/api/chat/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:Buffer.from('${b64}','base64').toString()})}).then(async r=>{console.log(await r.text());process.exit(0)}).catch(e=>{console.error(e);process.exit(1)})"`;
             reply = {
               choices: [
                 {
@@ -243,8 +274,9 @@ test("subagent loopback self-test is not a user message and cannot confirm conne
       assert.equal(postedBody.message.role, "user");
       assert.equal(postedBody.message.origin, "human");
 
-      await waitFor(() =>
-        daemon.chatStore.getAllMessages().some((m) => m.text.includes("还没连通，卡在没有外部回执"))
+      await waitFor(
+        () => daemon.chatStore.getAllMessages().some((m) => m.text.includes("还没连通，卡在没有外部回执")),
+        15_000
       );
 
       const injected = daemon.chatStore
