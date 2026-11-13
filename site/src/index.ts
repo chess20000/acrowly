@@ -1,7 +1,7 @@
 import promptMd from "./prompt.md?raw";
 import { renderLandingPage } from "./page.js";
 
-const landingHtml = renderLandingPage(promptMd);
+const landingHtml = renderLandingPage();
 
 const SECURITY_HEADERS = {
   "X-Content-Type-Options": "nosniff",
