@@ -23,9 +23,47 @@ async function isLocalServerAlive(url: string): Promise<boolean> {
   }
 }
 
+function printHelp(): void {
+  console.log(`Acrowly CLI (v0.1.0)
+
+用法:
+  acl                      首次引导配置协调器模型，启动后端并进入纯终端对话
+  acl setup                重新配置协调器模型（保留授权密钥与历史数据）
+  acl keygen               生成或查看本机客户端 Ed25519 密钥与公钥
+  acl add-key <pubkey>     添加已授权设备公钥（可加 --label <设备名>）
+  acl daemon               仅启动无头后端服务（默认 http://127.0.0.1:8787）
+  acl chat [--url <url>]   连接到本地或远端服务端终端对话（自动 Ed25519 签名登录）
+  acl relay [--port 8788]  启动自托管无状态穿透中继服务器
+  acl --help | -h          显示本帮助信息`);
+}
+
+const KNOWN_SUBCOMMANDS = new Set([
+  "start",
+  "setup",
+  "daemon",
+  "chat",
+  "relay",
+  "keygen",
+  "add-key",
+  "help",
+]);
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+  if (args.includes("--help") || args.includes("-h") || args[0] === "help") {
+    printHelp();
+    return;
+  }
+  if (args.includes("--version") || args.includes("-v")) {
+    console.log("0.1.0");
+    return;
+  }
+
   const subcommand = args[0] && !args[0].startsWith("-") ? args[0] : "start";
+  if (!KNOWN_SUBCOMMANDS.has(subcommand)) {
+    printHelp();
+    throw new Error(`未知命令: ${subcommand}`);
+  }
 
   if (subcommand === "keygen") {
     const pair = await ensureClientEd25519KeyPair();
