@@ -7,7 +7,7 @@ export function renderLandingPage(): string {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Acrowly</title>
+  <title>Acr0w/y</title>
   <style>
     body {
       max-width: 640px;
@@ -51,7 +51,7 @@ export function renderLandingPage(): string {
   </style>
 </head>
 <body>
-  <h1>Acrowly</h1>
+  <h1>Acr0w/y</h1>
   <p>无头个人 AI 协调器。复制发给你电脑上的 Agent 即可安装（本页仅作入口，非核心依赖）：</p>
   <pre id="p">${INSTALL_PROMPT}</pre>
   <button id="b" type="button">复制 Prompt</button>
