@@ -1,5 +1,7 @@
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { MessageOrigin } from "../types.js";
 
@@ -100,7 +102,9 @@ function isLocalChatPost(input: RequestInfo | URL, init?: RequestInit): boolean 
  * is that actor, even when the client is curl and does not send our header.
  */
 export function attributeLoopbackClient(remotePort: number | undefined): ActorIdentity | undefined {
-  if (!remotePort || shellPids.size === 0 || process.platform !== "linux") return undefined;
+  if (!remotePort || shellPids.size === 0) return undefined;
+  if (process.platform === "win32") return attributeWindowsClient(remotePort);
+  if (process.platform !== "linux") return undefined;
   const inodes = inodesForLocalPort(remotePort);
   if (inodes.size === 0) return undefined;
 
@@ -120,6 +124,95 @@ export function attributeLoopbackClient(remotePort: number | undefined): ActorId
     if (pidOwnsInode(pid, inodes)) return actorFromPid(pid);
   }
   return undefined;
+}
+
+function windowsSystemExe(name: string): string {
+  const root = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  return path.win32.join(root, "System32", name);
+}
+
+/**
+ * `netstat -ano` owner of the loopback socket whose local port is the peer
+ * port the server accepted. Locale-independent: the state column is ignored.
+ * Both the client row (local port = peer) and the server row exist; only the
+ * peer port matches the client.
+ */
+export function parseNetstatPid(output: string, localPort: number): number | undefined {
+  for (const line of output.split(/\r?\n/)) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 5) continue;
+    if (!/^TCP$/i.test(parts[0] ?? "")) continue;
+    const local = parts[1] ?? "";
+    const port = Number(local.slice(local.lastIndexOf(":") + 1));
+    if (port !== localPort) continue;
+    const pid = Number(parts[parts.length - 1]);
+    if (Number.isInteger(pid) && pid > 0) return pid;
+  }
+  return undefined;
+}
+
+/** Walk parent pids until one of them is a shell this process spawned. */
+export function actorForProcessTree(
+  pid: number,
+  ppids: ReadonlyMap<number, number>,
+  shells: ReadonlyMap<number, ActorIdentity>
+): ActorIdentity | undefined {
+  let current: number | undefined = pid;
+  const seen = new Set<number>();
+  for (let hop = 0; hop < 16 && current && current > 0 && !seen.has(current); hop += 1) {
+    seen.add(current);
+    const actor = shells.get(current);
+    if (actor) return actor;
+    const parent = ppids.get(current);
+    if (parent === undefined || parent === current) return undefined;
+    current = parent;
+  }
+  return undefined;
+}
+
+function attributeWindowsClient(remotePort: number): ActorIdentity | undefined {
+  let owner: number | undefined;
+  try {
+    const netstat = execFileSync(windowsSystemExe("netstat.exe"), ["-ano"], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 5000,
+    });
+    owner = parseNetstatPid(netstat, remotePort);
+  } catch {
+    return undefined;
+  }
+  if (!owner) return undefined;
+  const direct = shellPids.get(owner);
+  if (direct && liveByToken.has(direct.token)) return direct;
+  let ppids: Map<number, number>;
+  try {
+    ppids = windowsParentMap();
+  } catch {
+    return undefined;
+  }
+  const actor = actorForProcessTree(owner, ppids, shellPids);
+  if (!actor || !liveByToken.has(actor.token)) return undefined;
+  return actor;
+}
+
+function windowsParentMap(): Map<number, number> {
+  const script =
+    "Get-CimInstance Win32_Process | ForEach-Object { '{0} {1}' -f $_.ProcessId, $_.ParentProcessId }";
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const exe = windowsSystemExe("WindowsPowerShell\\v1.0\\powershell.exe");
+  const out = execFileSync(
+    exe,
+    ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+    { encoding: "utf8", windowsHide: true, timeout: 8000 }
+  );
+  const map = new Map<number, number>();
+  for (const line of out.split(/\r?\n/)) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (!match?.[1] || !match[2]) continue;
+    map.set(Number(match[1]), Number(match[2]));
+  }
+  return map;
 }
 
 function actorFromPid(pid: number): ActorIdentity | undefined {

@@ -1,4 +1,7 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   currentActor,
   registerShellPid,
@@ -24,6 +27,20 @@ const liveJobs = new Set<LiveJob>();
 export function stopTrackedShells(): void {
   for (const job of liveJobs) {
     clearTimeout(job.timer);
+    if (job.pid > 0 && process.platform === "win32") {
+      const killer = spawn("taskkill", ["/PID", String(job.pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      killer.on("error", () => {
+        try {
+          process.kill(job.pid);
+        } catch {
+          // already gone
+        }
+      });
+      continue;
+    }
     try {
       process.kill(-job.pid, "SIGTERM");
     } catch {
@@ -43,21 +60,91 @@ export interface ShellRunResult {
   background: boolean;
 }
 
-function shellBin(): string {
-  return process.platform === "win32" ? "powershell.exe" : "/bin/sh";
+function powershellExe(): string {
+  const root = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  return path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+/**
+ * Windows PowerShell strips unescaped `"` from `-Command` before the script runs,
+ * which turns `node -e "fetch(...)"` into a syntax error so the loopback post
+ * never happens. `-EncodedCommand` is the UTF-16LE script with quoting intact.
+ * Non-ASCII native arguments are still lossy in Windows PowerShell 5.1 when
+ * there is no console; callers that must round-trip Unicode should keep the
+ * command ASCII (for example base64) and let Node decode it.
+ */
+export function encodePowerShellCommand(command: string): string {
+  const script = [
+    "try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}",
+    "$OutputEncoding = New-Object System.Text.UTF8Encoding $false",
+    command,
+    "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }",
+  ].join("\r\n");
+  return Buffer.from(script, "utf16le").toString("base64");
+}
+
+function spawnShell(command: string, options: SpawnOptions): ChildProcess {
+  if (process.platform === "win32") {
+    return spawn(
+      powershellExe(),
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encodePowerShellCommand(command),
+      ],
+      { ...options, windowsHide: true }
+    );
+  }
+  return spawn("/bin/sh", ["-c", command], options);
+}
+
+const ACTOR_PRELOAD_SOURCE = `
+const token = process.env.ACROWLY_ACTOR_TOKEN;
+if (token && typeof global.fetch === "function") {
+  const orig = global.fetch;
+  global.fetch = function (input, init) {
+    try {
+      const url = typeof input === "string" ? input : (input && input.url) || "";
+      const method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
+      if (method === "POST" && String(url).includes("/api/chat/messages")) {
+        const headers = new Headers((init && init.headers) || (typeof Request !== "undefined" && input instanceof Request ? input.headers : undefined));
+        if (!headers.has("x-acrowly-actor")) headers.set("x-acrowly-actor", token);
+        init = Object.assign({}, init, { headers });
+      }
+    } catch (err) {
+      // Never block the command if tagging fails.
+    }
+    return orig.apply(this, [input, init]);
+  };
+}
+`;
+
+let actorPreloadPath: string | undefined;
+
+function ensureActorPreload(): string {
+  if (actorPreloadPath) return actorPreloadPath;
+  actorPreloadPath = path.join(os.tmpdir(), "acrowly-actor-preload.cjs");
+  fs.writeFileSync(actorPreloadPath, ACTOR_PRELOAD_SOURCE, "utf8");
+  return actorPreloadPath;
 }
 
 function actorEnv(actor: ActorIdentity | undefined): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    ...(actor
-      ? {
-          ACROWLY_ACTOR_TOKEN: actor.token,
-          ACROWLY_ACTOR_ORIGIN: actor.kind,
-          ACROWLY_ACTOR_LABEL: actor.label,
-        }
-      : {}),
-  };
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (!actor) return env;
+  env.ACROWLY_ACTOR_TOKEN = actor.token;
+  env.ACROWLY_ACTOR_ORIGIN = actor.kind;
+  env.ACROWLY_ACTOR_LABEL = actor.label;
+  // Windows cannot read another process's environment. Child `node` still
+  // inherits this and --require tags loopback chat posts with the actor token.
+  // NODE_OPTIONS treats backslash as an escape, so Windows paths must use /.
+  const preload = ensureActorPreload().replace(/\\/g, "/");
+  const quoted = preload.includes(" ") ? `"${preload}"` : preload;
+  const prev = env.NODE_OPTIONS?.trim();
+  env.NODE_OPTIONS = [prev, `--require ${quoted}`].filter(Boolean).join(" ");
+  return env;
 }
 
 /** `cmd &` is a detached waiter. `cmd &&` is not. */
@@ -71,6 +158,21 @@ export function splitBackgroundCommand(command: string): { background: boolean; 
 
 function killGroup(child: ChildProcess): void {
   if (!child.pid) return;
+  if (process.platform === "win32") {
+    // Kill the PowerShell process and anything it started (node, curl, sleep).
+    const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    killer.on("error", () => {
+      try {
+        child.kill();
+      } catch {
+        // already gone
+      }
+    });
+    return;
+  }
   try {
     process.kill(-child.pid, "SIGTERM");
   } catch {
@@ -148,8 +250,7 @@ function startBackground(options: {
 }): string {
   const label = options.actor?.label || "shell";
   if (options.actor) retainActor(options.actor);
-  const child = spawn(options.command, {
-    shell: shellBin(),
+  const child = spawnShell(options.command, {
     cwd: options.cwd,
     env: actorEnv(options.actor),
     detached: process.platform !== "win32",
@@ -214,8 +315,7 @@ function runForeground(options: {
       reject(new Error("Aborted"));
       return;
     }
-    const child = spawn(options.command, {
-      shell: shellBin(),
+    const child = spawnShell(options.command, {
       cwd: options.cwd,
       env: actorEnv(options.actor),
       detached: process.platform !== "win32",
