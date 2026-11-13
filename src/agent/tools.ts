@@ -180,11 +180,14 @@ const COORDINATOR_BASE_TOOL_DEFS: ToolDefinition[] = [
   {
     name: "send_chat_message",
     description:
-      "Send an immediate conversational update to the user in the chat stream (useful before starting a longer subagent task).",
+      "Send an immediate plain-text reply to the user (keep under 100 Chinese characters, no Markdown) before starting longer work.",
     parameters: {
       type: "object",
       properties: {
-        text: { type: "string", description: "Pure text/Markdown message to send immediately." },
+        text: {
+          type: "string",
+          description: "Plain text message under 100 Chinese characters (no Markdown formatting).",
+        },
       },
       required: ["text"],
     },
@@ -532,6 +535,33 @@ export function buildSubagentToolExecutor(deps: ToolRuntimeDeps): SubagentToolEx
   };
 }
 
+export function stripCoordinatorMarkdown(input: string): string {
+  let text = input.replace(/\r\n/g, "\n");
+  // Fenced code blocks -> inner content
+  text = text.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_m, inner: string) => inner.trim());
+  // Inline code -> inner text
+  text = text.replace(/`([^`\n]+)`/g, "$1");
+  // Markdown images ![alt](url) -> plain text + url
+  text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_m, alt: string, url: string) =>
+    alt.trim() ? `${alt.trim()} ${url}` : url
+  );
+  // Markdown links [label](url) -> plain text (avoid breaking raw paths)
+  text = text.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, label: string, url: string) =>
+    label.trim() === url.trim() ? url : `${label.trim()} (${url})`
+  );
+  // ATX headings & blockquotes
+  text = text.replace(/^\s{0,3}#{1,6}\s+/gm, "");
+  text = text.replace(/^\s*>\s?/gm, "");
+  // Unordered list bullets & horizontal rules
+  text = text.replace(/^\s*[-*+]\s+/gm, "");
+  text = text.replace(/^\s*([-*_])\1{2,}\s*$/gm, "");
+  // Bold / italic wrappers (leave intra-word underscores like file_123 intact)
+  text = text.replace(/\*\*([^*\n]+)\*\*/g, "$1");
+  text = text.replace(/__([^_\n]+)__/g, "$1");
+  text = text.replace(/(^|[^\w*])\*([^*\n]+)\*(?=[^\w*]|$)/g, "$1$2");
+  return text.replace(/\n{3,}/g, "\n\n").trim();
+}
+
 export function getCoordinatorToolDefinitions(extensionLoader: ExtensionLoader): ToolDefinition[] {
   const extDefs: ToolDefinition[] = extensionLoader.getTools().map((t) => ({
     name: t.name,
@@ -589,7 +619,7 @@ export async function executeCoordinatorTool(
     }
 
     case "send_chat_message": {
-      const text = String(args.text ?? "").trim();
+      const text = stripCoordinatorMarkdown(String(args.text ?? ""));
       if (!text) return JSON.stringify({ skipped: true });
       const { message } = await deps.chatStore.appendMessage({ role: "assistant", text });
       return JSON.stringify({ sent: true, seq: message.seq, id: message.id });

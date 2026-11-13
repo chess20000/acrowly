@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { ConfigStore, resolveRuntimePaths } from "../config/store.js";
 import { LlmClient } from "../llm/client.js";
+import { stripCoordinatorMarkdown } from "../agent/tools.js";
 import { AcrowlyRelayServer } from "../relay/server.js";
 import { createAcrowlyDaemon } from "../runtime.js";
 import {
@@ -813,6 +814,114 @@ test("Coordinator interrupts its own wait immediately on new user message withou
         }
       }
       assert.match(String(mergedTurn[mergedTurn.length - 1].content ?? ""), /连续消息1\n\n任务B：连续消息2/);
+    } finally {
+      await daemon.stop();
+      mockServer.closeAllConnections();
+      await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+      if (prevPort === undefined) delete process.env.PORT;
+      else process.env.PORT = prevPort;
+    }
+  });
+});
+
+test("Coordinator replies strip accidental Markdown, keep plain welcome <= 100 chars, and instruct concise plain text", async () => {
+  assert.equal(
+    stripCoordinatorMarkdown("### 标题\n- 第一条：`ext_greet_user` **完成**\n![图](/api/files/file_1/a.png)"),
+    "标题\n第一条：ext_greet_user 完成\n图 /api/files/file_1/a.png"
+  );
+  assert.equal(
+    stripCoordinatorMarkdown("[报告](/api/files/file_2/r.pdf)"),
+    "报告 (/api/files/file_2/r.pdf)"
+  );
+
+  await withTempDir(async (dir) => {
+    const prevPort = process.env.PORT;
+    process.env.PORT = "0";
+    let capturedSystemPrompt = "";
+    let step = 0;
+
+    const mockServer = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+          messages: Array<{ role: string; content: unknown }>;
+        };
+        capturedSystemPrompt = String(body.messages[0]?.content ?? "");
+        step += 1;
+
+        const reply =
+          step === 1
+            ? {
+                choices: [
+                  {
+                    message: {
+                      content: null,
+                      tool_calls: [
+                        {
+                          id: "call_msg_1",
+                          type: "function",
+                          function: {
+                            name: "send_chat_message",
+                            arguments: JSON.stringify({
+                              text: "**收到**，正在查 `status`。",
+                            }),
+                          },
+                        },
+                      ],
+                    },
+                  },
+                ],
+              }
+            : {
+                choices: [
+                  {
+                    message: {
+                      content: "### 结果\n- 状态正常，文件：/api/files/file_1/out.txt",
+                    },
+                  },
+                ],
+              };
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(reply));
+      });
+    });
+
+    await new Promise<void>((resolve) => mockServer.listen(0, "127.0.0.1", resolve));
+    const port = (mockServer.address() as { port: number }).port;
+    const daemon = await createAcrowlyDaemon(dir);
+
+    try {
+      await daemon.configStore.setBootstrapModel({
+        provider: "deepseek",
+        apiKey: "sk-test",
+        model: "deepseek-flash",
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+      });
+      await daemon.start();
+
+      const welcome = daemon.chatStore.getAllMessages()[0];
+      assert.ok(welcome && welcome.role === "assistant");
+      assert.ok(welcome.text.length <= 100, `Welcome too long: ${welcome.text.length}`);
+      assert.doesNotMatch(welcome.text, /(\*\*|`|^#)/m);
+
+      const userMsg = await daemon.chatStore.appendMessage({ role: "user", text: "查一下状态" });
+      daemon.coordinator.notifyUserMessage();
+
+      await waitFor(() =>
+        daemon.chatStore
+          .getAllMessages()
+          .some((m) => m.role === "assistant" && m.text.includes("/api/files/file_1/out.txt"))
+      );
+
+      assert.match(capturedSystemPrompt, /100 字以内/);
+      assert.match(capturedSystemPrompt, /严禁使用 Markdown/);
+
+      const replies = daemon.chatStore
+        .getAllMessages()
+        .filter((m) => m.role === "assistant" && m.seq > userMsg.message.seq);
+      assert.equal(replies[0].text, "收到，正在查 status。");
+      assert.equal(replies[1].text, "结果\n状态正常，文件：/api/files/file_1/out.txt");
     } finally {
       await daemon.stop();
       mockServer.closeAllConnections();

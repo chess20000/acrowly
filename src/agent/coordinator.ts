@@ -12,6 +12,7 @@ import type { SubagentManager } from "./subagent.js";
 import {
   executeCoordinatorTool,
   getCoordinatorToolDefinitions,
+  stripCoordinatorMarkdown,
   type ToolRuntimeDeps,
 } from "./tools.js";
 
@@ -143,14 +144,8 @@ export class CoordinatorEngine {
     const config = this.deps.configStore.getConfig();
     const model = config.models[config.coordinatorModelAlias];
     const greeting = model
-      ? `你好！我是你的 Acrowly 主协调器（当前脑子接的是 **${model.provider} / ${model.model}**）。\n\n` +
-        `先说下咱们怎么配合：以后你只要直接跟我聊天，脏活累活我都会拆给子代理去跑，自己专心帮你把关、顺便给你讲讲里面的门道。\n\n` +
-        `现在咱们刚启动完最核心的无头后端（本机客户端 Ed25519 公钥已自动授权，整个服务只认密钥、不用记密码）。你接下来想先做哪几件事？比如：\n` +
-        `1. 把你的手机 / 浏览器等客户端生成的 **Ed25519 公钥**直接贴给我，我帮你加进授权列表；\n` +
-        `2. 配好 \`acrowly.com\` 穿透连接（没有公网 IP 也能随时随地连回来）；\n` +
-        `3. 让我现场派个子代理给你写一个自带密钥登录的极简单对话框本地 WebUI！\n\n` +
-        `直接用平时说话的方式告诉我你想先弄哪个就行。`
-      : `你好！我是你的 Acrowly 主协调器，目前还没有配置模型，请先完成首次启动配置。`;
+      ? `你好！我是 Acrowly 主协调器（当前模型 ${model.provider}/${model.model}）。日常任务我会派子代理去跑，直接说想做的事、贴设备公钥或配穿透就行。`
+      : "你好！我是 Acrowly 主协调器，目前还没有配置模型，请先完成首次启动配置。";
 
     await this.deps.chatStore.appendMessage({
       role: "assistant",
@@ -335,7 +330,7 @@ export class CoordinatorEngine {
         llmMessages.push(toAssistantLlmMessage(res));
 
         if (res.toolCalls.length === 0) {
-          const replyText = res.content.trim();
+          const replyText = stripCoordinatorMarkdown(res.content);
           if (replyText) {
             await this.deps.chatStore.appendMessage({
               role: "assistant",
@@ -375,13 +370,16 @@ export class CoordinatorEngine {
               repliedToUserThisTurn = true;
             }
           }
-        } else if (!repliedToUserThisTurn && res.content.trim()) {
-          // Allow direct non-empty assistant text accompanying step-0 tool calls to deliver immediately
-          await this.deps.chatStore.appendMessage({
-            role: "assistant",
-            text: res.content.trim(),
-          });
-          repliedToUserThisTurn = true;
+        } else {
+          const directReply = !repliedToUserThisTurn ? stripCoordinatorMarkdown(res.content) : "";
+          if (directReply) {
+            // Allow direct non-empty assistant text accompanying step-0 tool calls to deliver immediately
+            await this.deps.chatStore.appendMessage({
+              role: "assistant",
+              text: directReply,
+            });
+            repliedToUserThisTurn = true;
+          }
         }
 
         if (this.stopped || abortController.signal.aborted) break;
@@ -434,7 +432,7 @@ export class CoordinatorEngine {
       const msg = err instanceof Error ? err.message : String(err);
       await this.deps.chatStore.appendMessage({
         role: "assistant",
-        text: `刚才调用模型或工具时出了点岔子：\`${msg}\`。${formatCoordinatorErrorHint(msg)}`,
+        text: `刚才调用模型或工具出错：${msg}。${formatCoordinatorErrorHint(msg)}`,
       });
     } finally {
       if (this.abortController === abortController) {
