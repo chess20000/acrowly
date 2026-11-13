@@ -1,0 +1,31 @@
+{
+  "name": "acrowly",
+  "version": "0.1.0",
+  "description": "Minimalist self-hosted personal AI coordinator server with pure-text chat API, subagents, hot-pluggable extensions, and acrowly.com outbound relay.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "acl": "dist/index.js",
+    "acrowly": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "daemon": "node dist/index.js daemon",
+    "chat": "node dist/index.js chat",
+    "relay": "node dist/index.js relay",
+    "test": "node --test dist/test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.8.3"
+  }
+}
