@@ -1,13 +1,17 @@
+import logoSvg from "./logo.svg?raw";
+
 const INSTALL_PROMPT =
   "Fetch and execute the appropriate instructions to install and set up Acrowly on my machine from https://acrowly.com/prompt.md";
 
 export function renderLandingPage(): string {
+  const inlineLogo = logoSvg.trim().replace("<svg ", '<svg aria-hidden="true" ');
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Acr0w/y</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <style>
     body {
       max-width: 640px;
@@ -18,7 +22,14 @@ export function renderLandingPage(): string {
       color: #111;
       background: #fff;
     }
-    h1 { font-size: 20px; margin: 0 0 8px; }
+    h1 {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 20px;
+      margin: 0 0 8px;
+    }
+    h1 svg { width: 22px; height: 22px; flex-shrink: 0; }
     p { margin: 0 0 16px; color: #555; font-size: 14px; }
     pre {
       padding: 12px;
@@ -51,8 +62,8 @@ export function renderLandingPage(): string {
   </style>
 </head>
 <body>
-  <h1>Acr0w/y</h1>
-  <p>你的个人助手。复制发给你电脑上的 Agent 即可安装。</p>
+  <h1>${inlineLogo}<span>Acr0w/y</span></h1>
+  <p>你的个人助手。复制发给你电脑上的 Agent 即可安装。<br />请确保你明白以下声明后再继续安装：acrowly的默认权限设置是完全访问权限。使用acrowly harness过程中的一切可能损失，都需要你自己承担。</p>
   <pre id="p">${INSTALL_PROMPT}</pre>
   <button id="b" type="button">复制 Prompt</button>
   <div class="links">

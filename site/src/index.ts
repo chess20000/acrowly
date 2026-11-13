@@ -1,7 +1,12 @@
+import logoSvg from "./logo.svg?raw";
 import promptMd from "./prompt.md?raw";
 import { renderLandingPage } from "./page.js";
 
 const landingHtml = renderLandingPage();
+const standaloneLogoSvg = logoSvg.replace(
+  /(<svg[^>]*>)/,
+  "$1<style>svg{color:#111}@media(prefers-color-scheme:dark){svg{color:#eaeaea}}</style>"
+);
 
 const SECURITY_HEADERS = {
   "X-Content-Type-Options": "nosniff",
@@ -31,6 +36,17 @@ function respondMarkdown(markdown: string): Response {
   });
 }
 
+function respondSvg(svg: string): Response {
+  return new Response(svg, {
+    status: 200,
+    headers: {
+      ...SECURITY_HEADERS,
+      "Content-Type": "image/svg+xml; charset=utf-8",
+      "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400",
+    },
+  });
+}
+
 export default {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -53,6 +69,10 @@ export default {
 
     if (pathname === "/prompt.md") {
       return respondMarkdown(promptMd);
+    }
+
+    if (pathname === "/logo.svg" || pathname === "/favicon.svg") {
+      return respondSvg(standaloneLogoSvg);
     }
 
     if (pathname === "/health") {
