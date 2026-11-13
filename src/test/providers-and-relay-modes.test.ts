@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { ConfigStore, resolveRuntimePaths } from "../config/store.js";
 import { LlmClient } from "../llm/client.js";
 import { stripCoordinatorMarkdown } from "../agent/tools.js";
@@ -19,7 +22,7 @@ async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   try {
     await fn(dir);
   } finally {
-    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 }
 
@@ -931,3 +934,367 @@ test("Coordinator replies strip accidental Markdown, keep plain welcome <= 100 c
     }
   });
 });
+
+test("restart_service blocks while subagents are running unless forced, then emits restart marker on reboot", async () => {
+  await withTempDir(async (dir) => {
+    const prevPort = process.env.PORT;
+    process.env.PORT = "0";
+
+    let resolveSubStarted: (() => void) | undefined;
+    const subStartedPromise = new Promise<void>((resolve) => {
+      resolveSubStarted = resolve;
+    });
+    let allowSubFinish!: () => void;
+    const subFinishGate = new Promise<void>((resolve) => {
+      allowSubFinish = resolve;
+    });
+
+    let restartCalledReason: string | undefined;
+    let coordStep = 0;
+
+    const mockServer = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+          messages: Array<{ role: string; content?: string | null }>;
+        };
+        const sys = String(body.messages[0]?.content ?? "");
+        const lastMsg = body.messages[body.messages.length - 1];
+
+        if (sys.includes("执行型子代理")) {
+          resolveSubStarted?.();
+          void subFinishGate.then(() => {
+            if (!res.writableEnded) {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ choices: [{ message: { content: "子代理构建完成" } }] }));
+            }
+          });
+          return;
+        }
+
+        coordStep += 1;
+        let reply: unknown;
+        if (coordStep === 1) {
+          reply = {
+            choices: [
+              {
+                message: {
+                  content: "好，先让子代理干活。",
+                  tool_calls: [
+                    {
+                      id: "sub_1",
+                      type: "function",
+                      function: {
+                        name: "dispatch_subagent",
+                        arguments: JSON.stringify({ label: "builder", task: "build code" }),
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          };
+        } else if (coordStep === 2) {
+          // Interrupted during Turn 1: tries restart_service while builder subagent is STILL running
+          reply = {
+            choices: [
+              {
+                message: {
+                  content: "尝试重启试试。",
+                  tool_calls: [
+                    {
+                      id: "rst_blocked",
+                      type: "function",
+                      function: {
+                        name: "restart_service",
+                        arguments: JSON.stringify({ reason: "测试拦截" }),
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          };
+        } else if (coordStep === 3) {
+          assert.match(String(lastMsg?.content ?? ""), /^BLOCKED_RUNNING_SUBAGENTS:/);
+          allowSubFinish();
+          reply = {
+            choices: [{ message: { content: "有个子代理还在跑，先等它完成再重启。" } }],
+          };
+        } else if (coordStep === 4) {
+          // After subagent completes, restart_service succeeds
+          reply = {
+            choices: [
+              {
+                message: {
+                  content: "准备重启加载。",
+                  tool_calls: [
+                    {
+                      id: "rst_ok",
+                      type: "function",
+                      function: {
+                        name: "restart_service",
+                        arguments: JSON.stringify({ reason: "加载最新构建" }),
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          };
+        } else {
+          reply = { choices: [{ message: { content: "ok" } }] };
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(reply));
+      });
+    });
+
+    await new Promise<void>((resolve) => mockServer.listen(0, "127.0.0.1", resolve));
+    const port = (mockServer.address() as { port: number }).port;
+
+    const daemon1 = await createAcrowlyDaemon(dir, {
+      onRestartRequested: async (reason) => {
+        restartCalledReason = reason;
+      },
+    });
+    let daemon2: Awaited<ReturnType<typeof createAcrowlyDaemon>> | undefined;
+
+    try {
+      await daemon1.configStore.setBootstrapModel({
+        provider: "openai",
+        apiKey: "sk-test",
+        model: "gpt-4.1",
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+      });
+      await daemon1.start();
+
+      await daemon1.chatStore.appendMessage({ role: "user", text: "启动后台构建" });
+      daemon1.coordinator.notifyUserMessage();
+      await subStartedPromise;
+
+      await daemon1.chatStore.appendMessage({ role: "user", text: "直接重启" });
+      daemon1.coordinator.notifyUserMessage();
+
+      await waitFor(() =>
+        daemon1.chatStore
+          .getAllMessages()
+          .some((m) => m.role === "assistant" && m.text.includes("有个子代理还在跑"))
+      );
+      assert.equal(restartCalledReason, undefined);
+
+      // Wait until background subagent finishes and triggers post-completion wakeup (coordStep 4 -> restart_service)
+      await waitFor(() => restartCalledReason === "加载最新构建", 3000);
+      await daemon1.stop();
+
+      // New daemon boots and consumes restart-pending.json automatically
+      daemon2 = await createAcrowlyDaemon(dir);
+      await daemon2.start();
+      const postRestartMsgs = daemon2.chatStore.getAllMessages();
+      assert.ok(
+        postRestartMsgs.some(
+          (m) =>
+            m.role === "assistant" &&
+            m.text.includes(`服务已重启完成（PID ${process.pid}），新代码已生效（加载最新构建）`)
+        )
+      );
+    } finally {
+      await daemon2?.stop();
+      await daemon1.stop();
+      mockServer.closeAllConnections();
+      await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+      if (prevPort === undefined) delete process.env.PORT;
+      else process.env.PORT = prevPort;
+    }
+  });
+});
+
+test("Real standalone daemon process self-restarts cleanly across port handoff and notifies SSE clients", async () => {
+  await withTempDir(async (dir) => {
+    const mockServer = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: "收到，现在自我重启。",
+                  tool_calls: [
+                    {
+                      id: "call_self_restart",
+                      type: "function",
+                      function: {
+                        name: "restart_service",
+                        arguments: JSON.stringify({ reason: "真实进程自重启验证" }),
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          })
+        );
+      });
+    });
+
+    await new Promise<void>((resolve) => mockServer.listen(0, "127.0.0.1", resolve));
+    const llmPort = (mockServer.address() as { port: number }).port;
+
+    // Pick an available port for the real daemon process
+    const daemonPort = await new Promise<number>((resolve, reject) => {
+      const probe = net.createServer();
+      probe.once("error", reject);
+      probe.listen(0, "127.0.0.1", () => {
+        const addr = probe.address() as { port: number };
+        probe.close(() => resolve(addr.port));
+      });
+    });
+
+    const paths = resolveRuntimePaths(dir);
+    const configStore = new ConfigStore(paths);
+    await configStore.init();
+    await configStore.setBootstrapModel({
+      provider: "openai",
+      apiKey: "sk-real-restart",
+      model: "gpt-4.1",
+      baseUrl: `http://127.0.0.1:${llmPort}/v1`,
+    });
+    const configRaw = JSON.parse(await fs.readFile(paths.configPath, "utf8")) as {
+      server: { host: string; port: number };
+    };
+    configRaw.server = { host: "127.0.0.1", port: daemonPort };
+    await fs.writeFile(paths.configPath, JSON.stringify(configRaw, null, 2), "utf8");
+
+    const entryJs = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "..",
+      "index.js"
+    );
+    const env: NodeJS.ProcessEnv = { ...process.env, ACROWLY_HOME: dir };
+    delete env.ACROWLY_SUPERVISED;
+
+    const child1 = spawn(process.execPath, [entryJs, "daemon"], {
+      cwd: dir,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    const pid1 = child1.pid!;
+    let child1ExitCode: number | null = null;
+    child1.on("exit", (code) => {
+      child1ExitCode = code;
+    });
+
+    let pid2: number | undefined;
+    const sseController = new AbortController();
+
+    try {
+      const baseUrl = `http://127.0.0.1:${daemonPort}`;
+      await waitForAsync(async () => {
+        try {
+          const r = await fetch(`${baseUrl}/api/health`);
+          return r.ok;
+        } catch {
+          return false;
+        }
+      }, 10_000);
+
+      // Hold an active SSE stream open (verifying httpServer.stop() closes keep-alive SSE sockets cleanly)
+      const sseRes = await fetch(`${baseUrl}/api/chat/stream?after_seq=0`, {
+        signal: sseController.signal,
+      });
+      assert.equal(sseRes.status, 200);
+      const sseReader = sseRes.body!.getReader();
+      void (async () => {
+        try {
+          while (true) {
+            const { done } = await sseReader.read();
+            if (done) break;
+          }
+        } catch {
+          // expected when old daemon stops for restart
+        }
+      })();
+
+      const sendRes = await fetch(`${baseUrl}/api/chat/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "重启你自己的进程" }),
+      });
+      assert.equal(sendRes.status, 202);
+
+      // Wait for old daemon PID to exit cleanly AND new daemon PID to boot and write confirmation message
+      let restartedText = "";
+      await waitForAsync(async () => {
+        if (child1ExitCode === null) return false;
+        try {
+          const r = await fetch(`${baseUrl}/api/chat/messages?limit=20`);
+          if (!r.ok) return false;
+          const data = (await r.json()) as { messages: Array<{ role: string; text: string }> };
+          const found = data.messages.find(
+            (m) => m.role === "assistant" && m.text.includes("服务已重启完成（PID ")
+          );
+          if (found) {
+            restartedText = found.text;
+            return true;
+          }
+          return false;
+        } catch {
+          return false;
+        }
+      }, 12_000);
+
+      assert.equal(child1ExitCode, 0);
+      const match = restartedText.match(/PID (\d+)/);
+      assert.ok(match, `Expected PID in message: ${restartedText}`);
+      pid2 = Number(match[1]);
+      assert.notEqual(pid2, pid1, "Replacement daemon must have a brand new OS PID");
+      assert.match(restartedText, /真实进程自重启验证/);
+    } finally {
+      sseController.abort();
+      if (child1ExitCode === null) {
+        try {
+          child1.kill();
+        } catch {
+          // ignore
+        }
+      }
+      if (pid2 && pid2 !== pid1) {
+        try {
+          process.kill(pid2);
+        } catch {
+          // ignore
+        }
+        await waitForAsync(async () => !isPidAlive(pid2!), 3000).catch(() => {});
+      }
+      if (isPidAlive(pid1)) {
+        await waitForAsync(async () => !isPidAlive(pid1), 3000).catch(() => {});
+      }
+      mockServer.closeAllConnections();
+      await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+    }
+  });
+});
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForAsync(condition: () => Promise<boolean>, timeoutMs = 8000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await condition()) return;
+    await new Promise((r) => setTimeout(r, 60));
+  }
+  throw new Error("Timed out waiting for async condition");
+}

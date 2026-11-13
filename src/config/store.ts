@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { AcrowlyConfig, AuthorizedPublicKey, ModelProfile, ProviderKind } from "../types.js";
 import { parseEd25519PublicKey } from "../server/ed25519.js";
 
-const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 export interface RuntimePaths {
   rootDir: string;
@@ -18,6 +18,7 @@ export interface RuntimePaths {
   configPath: string;
   secretsPath: string;
   contextPath: string;
+  restartMarkerPath: string;
 }
 
 export function resolveRuntimePaths(rootDir?: string): RuntimePaths {
@@ -44,6 +45,7 @@ export function resolveRuntimePaths(rootDir?: string): RuntimePaths {
     configPath: path.join(dataDir, "config.json"),
     secretsPath: path.join(dataDir, "secrets.json"),
     contextPath: path.join(dataDir, "context.json"),
+    restartMarkerPath: path.join(dataDir, "restart-pending.json"),
   };
 }
 

@@ -213,7 +213,7 @@ async function subscribeSseLoop(
         signal,
       });
       if (!res.ok || !res.body) {
-        await sleep(1500, signal);
+        await sleep(700, signal);
         continue;
       }
 
@@ -236,7 +236,7 @@ async function subscribeSseLoop(
       }
     } catch {
       if (signal.aborted) return;
-      await sleep(1500, signal);
+      await sleep(700, signal);
     }
   }
 }

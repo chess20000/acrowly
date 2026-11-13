@@ -1,10 +1,31 @@
 #!/usr/bin/env node
+import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { runFirstBootSetup } from "./cli/bootstrap.js";
 import { startPlainTerminalChat } from "./cli/chat.js";
 import { ConfigStore, resolveRuntimePaths } from "./config/store.js";
 import { AcrowlyRelayServer } from "./relay/server.js";
 import { createAcrowlyDaemon } from "./runtime.js";
 import { ensureClientEd25519KeyPair } from "./server/ed25519.js";
+
+const RESTART_EXIT_CODE = 75;
+
+function resolveEntryScriptPath(): string {
+  return fileURLToPath(import.meta.url);
+}
+
+function spawnDetachedDaemon(rootDir: string): void {
+  const env = { ...process.env };
+  delete env.ACROWLY_SUPERVISED;
+  const child = spawn(process.execPath, [resolveEntryScriptPath(), "daemon"], {
+    cwd: rootDir,
+    env,
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  child.unref();
+}
 
 function parseFlag(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -141,7 +162,19 @@ async function main(): Promise<void> {
   }
 
   if (subcommand === "daemon") {
-    const daemon = await createAcrowlyDaemon();
+    let exitingForRestart = false;
+    const daemon = await createAcrowlyDaemon(undefined, {
+      onRestartRequested: async () => {
+        exitingForRestart = true;
+        await daemon.stop();
+        if (process.env.ACROWLY_SUPERVISED === "1") {
+          process.exit(RESTART_EXIT_CODE);
+        } else {
+          spawnDetachedDaemon(daemon.configStore.paths.rootDir);
+          process.exit(0);
+        }
+      },
+    });
     const addr = await daemon.start();
     console.log(`Acrowly headless daemon listening on http://${addr.host}:${addr.port}`);
     if (daemon.configStore.getConfig().relay.enabled) {
@@ -149,16 +182,22 @@ async function main(): Promise<void> {
       console.log(`Outbound relay enabled: ${relay.url} (deviceId: ${relay.deviceId})`);
     }
     const shutdown = async () => {
+      if (exitingForRestart) return;
       await daemon.stop();
       process.exit(0);
     };
     process.on("SIGINT", () => void shutdown());
     process.on("SIGTERM", () => void shutdown());
+    process.on("message", (msg) => {
+      if (msg && typeof msg === "object" && (msg as { type?: string }).type === "shutdown") {
+        void shutdown();
+      }
+    });
     return;
   }
 
   // Default "start" flow: if daemon is already listening on port, attach terminal chat;
-  // otherwise boot daemon in-process and drop directly into plain terminal chat.
+  // otherwise boot a supervised child daemon so the Coordinator can self-restart seamlessly.
   const cfgServer = preConfig.getConfig().server;
   const localUrl = `http://${cfgServer.host}:${cfgServer.port}`;
 
@@ -167,15 +206,98 @@ async function main(): Promise<void> {
     return;
   }
 
-  const daemon = await createAcrowlyDaemon();
-  const addr = await daemon.start();
-  const startedUrl = `http://${addr.host}:${addr.port}`;
-  console.log(`Acrowly 无头后端已启动: ${startedUrl}`);
+  let activeChild: ChildProcess | undefined;
+  let shuttingDown = false;
+  let chatActive = false;
+  let bootError: Error | undefined;
+  let lastStderr = "";
+
+  const spawnManagedDaemon = (): void => {
+    lastStderr = "";
+    const child = spawn(process.execPath, [resolveEntryScriptPath(), "daemon"], {
+      cwd: preConfig.paths.rootDir,
+      env: { ...process.env, ACROWLY_SUPERVISED: "1" },
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      windowsHide: true,
+    });
+    activeChild = child;
+    child.stderr?.on("data", (chunk: Buffer) => {
+      lastStderr = (lastStderr + chunk.toString("utf8")).slice(-4000);
+    });
+    child.on("exit", (code) => {
+      if (activeChild === child) {
+        activeChild = undefined;
+      }
+      if (shuttingDown) return;
+      if (code === RESTART_EXIT_CODE) {
+        spawnManagedDaemon();
+        return;
+      }
+      const errDetail = lastStderr.trim() || `daemon exited with code ${code ?? "null"}`;
+      if (!chatActive) {
+        bootError = new Error(`后端启动失败: ${errDetail}`);
+      } else {
+        console.error(`\n[后端异常退出] ${errDetail}`);
+      }
+    });
+  };
+
+  spawnManagedDaemon();
+
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (bootError) throw bootError;
+    if (await isLocalServerAlive(localUrl)) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  if (bootError) throw bootError;
+  if (!(await isLocalServerAlive(localUrl))) {
+    shuttingDown = true;
+    activeChild?.kill();
+    throw new Error(`等待 Acrowly 后端启动超时 (${localUrl})`);
+  }
+
+  chatActive = true;
+  console.log(`Acrowly 无头后端已启动: ${localUrl}`);
 
   await startPlainTerminalChat({
-    baseUrl: startedUrl,
+    baseUrl: localUrl,
     onExit: async () => {
-      await daemon.stop();
+      shuttingDown = true;
+      const child = activeChild;
+      if (!child) return;
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(killTimer);
+          resolve();
+        };
+        const killTimer = setTimeout(() => {
+          try {
+            child.kill();
+          } catch {
+            // ignore
+          }
+          finish();
+        }, 3000);
+        child.once("exit", finish);
+        try {
+          if (child.connected) {
+            child.send({ type: "shutdown" });
+          } else {
+            child.kill();
+          }
+        } catch {
+          try {
+            child.kill();
+          } catch {
+            // ignore
+          }
+          finish();
+        }
+      });
     },
   });
 }

@@ -177,7 +177,9 @@ export class AcrowlyHttpServer {
     if (!this.server) return;
     const srv = this.server;
     this.server = undefined;
-    await new Promise<void>((resolve) => srv.close(() => resolve()));
+    const closePromise = new Promise<void>((resolve) => srv.close(() => resolve()));
+    srv.closeAllConnections?.();
+    await closePromise;
   }
 
   async dispatchTunneledRequest(req: NormalizedRequest, sink: HttpResponseSink): Promise<void> {

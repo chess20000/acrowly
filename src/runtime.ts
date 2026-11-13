@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import { CoordinatorEngine } from "./agent/coordinator.js";
 import { SubagentManager } from "./agent/subagent.js";
 import { ConfigStore, resolveRuntimePaths } from "./config/store.js";
@@ -24,7 +25,14 @@ export interface AcrowlyDaemon {
   stop: () => Promise<void>;
 }
 
-export async function createAcrowlyDaemon(rootDir?: string): Promise<AcrowlyDaemon> {
+export interface AcrowlyDaemonOptions {
+  onRestartRequested?: (reason: string) => Promise<void> | void;
+}
+
+export async function createAcrowlyDaemon(
+  rootDir?: string,
+  options?: AcrowlyDaemonOptions
+): Promise<AcrowlyDaemon> {
   const paths = resolveRuntimePaths(rootDir);
   const configStore = new ConfigStore(paths);
   await configStore.init();
@@ -51,6 +59,18 @@ export async function createAcrowlyDaemon(rootDir?: string): Promise<AcrowlyDaem
   const subagentManager = new SubagentManager(llm, paths);
 
   let tunnelClient!: TunnelClient;
+  let restartScheduled = false;
+
+  const handleRestartRequested = (reason: string): void => {
+    if (restartScheduled || !options?.onRestartRequested) return;
+    restartScheduled = true;
+    // Allow SSE flush of the pre-restart status message before closing server connections
+    setTimeout(() => {
+      void Promise.resolve(options.onRestartRequested!(reason)).catch((err) => {
+        console.error("Failed to execute self-restart:", err);
+      });
+    }, 100);
+  };
 
   const coordinator = new CoordinatorEngine({
     configStore,
@@ -63,6 +83,7 @@ export async function createAcrowlyDaemon(rootDir?: string): Promise<AcrowlyDaem
     llm,
     onRelayConfigUpdated: () => tunnelClient.syncConnection(),
     getRelayConnected: () => tunnelClient.isConnected(),
+    ...(options?.onRestartRequested ? { onRestartRequested: handleRestartRequested } : {}),
   });
 
   const httpServer = new AcrowlyHttpServer({
@@ -89,7 +110,25 @@ export async function createAcrowlyDaemon(rootDir?: string): Promise<AcrowlyDaem
       const addr = await httpServer.start();
       tunnelClient.start();
       coordinator.startBackgroundLoops();
-      if (configStore.getConfig().initialized) {
+
+      let restartedFromMarker = false;
+      try {
+        const raw = await fs.readFile(paths.restartMarkerPath, "utf8");
+        await fs.unlink(paths.restartMarkerPath).catch(() => {});
+        const parsed = JSON.parse(raw) as { reason?: string };
+        restartedFromMarker = true;
+        if (configStore.getConfig().initialized) {
+          const reasonNote = parsed.reason ? `（${parsed.reason}）` : "";
+          await chatStore.appendMessage({
+            role: "assistant",
+            text: `服务已重启完成（PID ${process.pid}），新代码已生效${reasonNote}。`,
+          });
+        }
+      } catch {
+        // No pending restart marker
+      }
+
+      if (!restartedFromMarker && configStore.getConfig().initialized) {
         await coordinator.sendWelcomeGreetingIfEmpty();
       }
       return addr;

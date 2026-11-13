@@ -68,6 +68,7 @@ export class CoordinatorEngine {
   private shutdownController = new AbortController();
   private pendingSubagentCompletions: SubagentRunRecord[] = [];
   private compactionPromise: Promise<string> | undefined;
+  private restartTriggered = false;
 
   constructor(
     private readonly deps: {
@@ -81,6 +82,7 @@ export class CoordinatorEngine {
       llm: LlmClient;
       onRelayConfigUpdated?: () => void;
       getRelayConnected?: () => boolean;
+      onRestartRequested?: (reason: string) => void;
     }
   ) {}
 
@@ -167,12 +169,25 @@ export class CoordinatorEngine {
     });
   }
 
+  private requestRestart(reason: string): void {
+    if (this.restartTriggered || this.stopped) return;
+    this.restartTriggered = true;
+    this.stopped = true;
+    this.rerunRequested = false;
+    this.pendingSubagentCompletions = [];
+    this.abortController?.abort(new Error("Restarting service"));
+    this.deps.onRestartRequested?.(reason);
+  }
+
   private createToolDeps(signal?: AbortSignal): ToolRuntimeDeps {
     return {
       ...this.deps,
       signal,
       subagentSignal: this.shutdownController.signal,
       onDetachedSubagentFinished: (run) => this.handleDetachedSubagentFinished(run),
+      ...(this.deps.onRestartRequested
+        ? { onRequestRestart: (reason: string) => this.requestRestart(reason) }
+        : {}),
       onTriggerCompaction: () => this.compactContext("manual"),
     };
   }

@@ -2,7 +2,7 @@ import { exec } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { ConfigStore } from "../config/store.js";
+import { writeFileAtomic, type ConfigStore } from "../config/store.js";
 import type { ExtensionLoader } from "../extensions/loader.js";
 import type { SnapshotManager } from "../extensions/snapshot.js";
 import type { ToolDefinition } from "../llm/types.js";
@@ -27,6 +27,7 @@ export interface ToolRuntimeDeps {
   /** Daemon shutdown signal (subagents keep running across Coordinator turn interrupts) */
   subagentSignal?: AbortSignal;
   onDetachedSubagentFinished?: (run: SubagentRunRecord) => void;
+  onRequestRestart?: (reason: string) => void;
   onTriggerCompaction: () => Promise<string>;
   onRelayConfigUpdated?: () => void;
   getRelayConnected?: () => boolean;
@@ -343,6 +344,24 @@ const COORDINATOR_BASE_TOOL_DEFS: ToolDefinition[] = [
       type: "object",
       properties: {
         snapshotId: { type: "string", description: "Optional snapshot ID (defaults to latest)." },
+      },
+    },
+  },
+  {
+    name: "restart_service",
+    description:
+      "Self-restart the Acrowly backend daemon to load updated dist/ code after git pull or npm run build. Reconnects chat clients automatically.",
+    parameters: {
+      type: "object",
+      properties: {
+        reason: {
+          type: "string",
+          description: "Short plain reason for the restart, e.g. '加载最新构建产物'.",
+        },
+        force: {
+          type: "boolean",
+          description: "Set true to restart even if background subagents are still running (default false).",
+        },
       },
     },
   },
@@ -676,6 +695,11 @@ export async function executeCoordinatorTool(
             ...deps.contextStore.getState(),
           },
           extensions: deps.extensionLoader.getReport(),
+          process: {
+            pid: process.pid,
+            supervised: process.env.ACROWLY_SUPERVISED === "1",
+            uptimeSec: Math.round(process.uptime()),
+          },
         },
         null,
         2
@@ -831,6 +855,33 @@ export async function executeCoordinatorTool(
 
     case "list_extensions": {
       return JSON.stringify(deps.extensionLoader.getReport(), null, 2);
+    }
+
+    case "restart_service": {
+      const reason = typeof args.reason === "string" ? stripCoordinatorMarkdown(args.reason) : "";
+      const force = args.force === true;
+      if (!force) {
+        const running = deps.subagentManager.listRuns(50).filter((r) => r.status === "running");
+        if (running.length > 0) {
+          return (
+            `BLOCKED_RUNNING_SUBAGENTS: 仍有 ${running.length} 个后台子代理在运行` +
+            `（${running.map((r) => r.label).join(", ")}），请等其完成后再重启，或传 force=true 强制重启。`
+          );
+        }
+      }
+      if (!deps.onRequestRestart) {
+        return "ERROR: 当前运行模式未挂载自重启控制器（仅 CLI daemon/acl 模式支持自重启）。";
+      }
+      await writeFileAtomic(
+        deps.configStore.paths.restartMarkerPath,
+        JSON.stringify({ requestedAt: new Date().toISOString(), reason })
+      );
+      await deps.chatStore.appendMessage({
+        role: "assistant",
+        text: "正在重启服务加载新代码，1~2 秒后自动恢复。",
+      });
+      deps.onRequestRestart(reason);
+      return JSON.stringify({ restarting: true, reason });
     }
 
     default: {
