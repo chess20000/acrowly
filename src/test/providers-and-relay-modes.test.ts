@@ -635,12 +635,13 @@ test("Coordinator blocks silent work tools on step 0 until an immediate reply is
   });
 });
 
-test("Coordinator immediately interrupts active slow subagent turn when a new user message arrives", async () => {
+test("Coordinator interrupts its own wait immediately on new user message without interrupting running subagent", async () => {
   await withTempDir(async (dir) => {
     const prevPort = process.env.PORT;
     process.env.PORT = "0";
 
     let subagentAborted = false;
+    let subagentFinished = false;
     let resolveSubagentStarted: (() => void) | undefined;
     const subagentStartedPromise = new Promise<void>((resolve) => {
       resolveSubagentStarted = resolve;
@@ -661,23 +662,21 @@ test("Coordinator immediately interrupts active slow subagent turn when a new us
           resolveSubagentStarted?.();
           const timer = setTimeout(() => {
             if (!res.writableEnded) {
+              subagentFinished = true;
               res.writeHead(200, { "Content-Type": "application/json" });
               res.end(
                 JSON.stringify({
-                  choices: [{ message: { content: "should-not-finish-after-abort" } }],
+                  choices: [{ message: { content: "子代理后台完成：微信 Bot 已就绪" } }],
                 })
               );
             }
-          }, 8000);
+          }, 500);
 
-          req.on("close", () => {
-            if (!res.writableEnded) {
-              subagentAborted = true;
-              clearTimeout(timer);
-            }
-          });
           res.on("close", () => {
             clearTimeout(timer);
+            if (!res.writableFinished && !subagentFinished) {
+              subagentAborted = true;
+            }
           });
           return;
         }
@@ -687,12 +686,26 @@ test("Coordinator immediately interrupts active slow subagent turn when a new us
           .map((m) => String(m.content ?? ""));
         const latestUser = userContents[userContents.length - 1] ?? "";
 
+        if (latestUser.includes("系统后台通知")) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              choices: [
+                { message: { content: "顺便同步：后台子代理任务已完成（微信 Bot 已就绪）" } },
+              ],
+            })
+          );
+          return;
+        }
+
         if (latestUser.includes("任务B")) {
           turn2SeenMessages.push(body.messages);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
-              choices: [{ message: { content: "已立即打断旧任务，先按你的最新指令“任务B”处理！" } }],
+              choices: [
+                { message: { content: "已立即打断协调器等待，先按你的最新指令“任务B”处理！" } },
+              ],
             })
           );
           return;
@@ -712,7 +725,10 @@ test("Coordinator immediately interrupts active slow subagent turn when a new us
                       type: "function",
                       function: {
                         name: "dispatch_subagent",
-                        arguments: JSON.stringify({ task: "执行一个很慢的调研" }),
+                        arguments: JSON.stringify({
+                          label: "wechat-bot",
+                          task: "后台执行一个耗时任务",
+                        }),
                       },
                     },
                   ],
@@ -750,16 +766,32 @@ test("Coordinator immediately interrupts active slow subagent turn when a new us
         () =>
           daemon.chatStore
             .getAllMessages()
-            .some((m) => m.role === "assistant" && m.text.includes("已立即打断旧任务")),
+            .some((m) => m.role === "assistant" && m.text.includes("已立即打断协调器等待")),
         3000
       );
 
       const elapsedMs = Date.now() - interruptAt;
-      assert.ok(elapsedMs < 2500, `Expected fast interrupt, got ${elapsedMs}ms`);
-      assert.equal(subagentAborted, true);
+      assert.ok(elapsedMs < 350, `Expected fast coordinator interrupt, got ${elapsedMs}ms`);
+      assert.equal(subagentAborted, false, "Subagent must NOT be aborted by user message");
+      assert.equal(subagentFinished, false, "Coordinator should reply BEFORE subagent finishes");
 
-      // Verify consecutive user messages without an interleaving assistant turn would still be valid;
-      // here Turn 1 already wrote "好的，正在执行任务A..." before subagent, so role alternation stays clean.
+      // Background subagent finishes undisturbed and Coordinator reports completion afterward
+      await waitFor(
+        () =>
+          daemon.chatStore
+            .getAllMessages()
+            .some((m) => m.role === "assistant" && m.text.includes("微信 Bot 已就绪")),
+        3000
+      );
+      assert.equal(subagentFinished, true);
+      assert.equal(subagentAborted, false);
+      assert.equal(
+        daemon.chatStore.getAllMessages().some((m) => m.text.includes("系统后台通知")),
+        false,
+        "Transient background notice must not pollute persistent chatStore"
+      );
+
+      // Verify consecutive user messages without an interleaving assistant turn stay valid
       assert.equal(turn2SeenMessages.length, 1);
       const roles = turn2SeenMessages[0].map((m) => m.role);
       for (let i = 1; i < roles.length; i += 1) {

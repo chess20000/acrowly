@@ -11,6 +11,7 @@ export interface SubagentToolExecutor {
 
 export class SubagentManager {
   private runs = new Map<string, SubagentRunRecord>();
+  private activePromises = new Set<Promise<SubagentRunRecord>>();
 
   constructor(
     private readonly llm: LlmClient,
@@ -19,6 +20,11 @@ export class SubagentManager {
 
   listRuns(limit = 20): SubagentRunRecord[] {
     return Array.from(this.runs.values()).slice(-limit).reverse();
+  }
+
+  async waitForAll(): Promise<void> {
+    if (this.activePromises.size === 0) return;
+    await Promise.allSettled(Array.from(this.activePromises));
   }
 
   async runTask(input: {
@@ -39,6 +45,27 @@ export class SubagentManager {
       startedAt: new Date().toISOString(),
     };
     this.runs.set(id, record);
+
+    const taskPromise = this.executeRun(record, input);
+    this.activePromises.add(taskPromise);
+    try {
+      return await taskPromise;
+    } finally {
+      this.activePromises.delete(taskPromise);
+    }
+  }
+
+  private async executeRun(
+    record: SubagentRunRecord,
+    input: {
+      label: string;
+      task: string;
+      profile: ModelProfile;
+      tools: SubagentToolExecutor;
+      maxSteps?: number;
+      signal?: AbortSignal;
+    }
+  ): Promise<SubagentRunRecord> {
 
     const systemPrompt = buildSubagentSystemPrompt(this.paths);
     const messages: LlmMessage[] = [{ role: "user", content: input.task }];

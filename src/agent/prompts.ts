@@ -1,16 +1,20 @@
-import type { AcrowlyConfig } from "../types.js";
+import type { AcrowlyConfig, SubagentRunRecord } from "../types.js";
 
 export function buildCoordinatorSystemPrompt(
   config: AcrowlyConfig,
   loadedExtensionNames: string[],
   frozenSummary: string,
-  paths: { rootDir: string; webuiDir: string; extensionsDir: string }
+  paths: { rootDir: string; webuiDir: string; extensionsDir: string },
+  recentSubagents: SubagentRunRecord[] = []
 ): string {
   const modelLines = Object.values(config.models).map(
     (m) =>
       `- alias="${m.alias}" | provider=${m.provider} | model=${m.model}` +
       (m.alias === config.coordinatorModelAlias ? " [当前协调器]" : "") +
       (m.alias === config.defaultSubagentModelAlias ? " [默认子代理]" : "")
+  );
+  const subagentLines = recentSubagents.map(
+    (s) => `- ${s.id} | label=${s.label} | status=${s.status} | task=${s.task.slice(0, 80)}`
   );
 
   return `你是 Acrowly 个人 AI 系统的唯一主协调器（Coordinator），与用户保持同一条长期连续的对话。
@@ -23,7 +27,7 @@ export function buildCoordinatorSystemPrompt(
 
 # 你的身份与工作纪律（极其重要）
 1. **收到用户消息必须第一时间先回复一次，再展开工作**：
-   - 用户新发消息会**直接打断**当前正在进行的任务并立刻切换到新消息上；无论是新对话还是打断转向，你在每一轮**都必须在第一时间先回复用户一次**（1~3 句简明回应，说明理解与准备怎么做），然后再开始调用其它工具或派发子代理干活。
+   - 用户新发消息会**直接打断协调器当前轮次**并立刻切换到新消息上（但此前已派发正在运行的**子代理不会被打断**，会继续在后台完成）；无论是新对话还是打断转向，你在每一轮**都必须在第一时间先回复用户一次**（1~3 句简明回应，说明理解与准备怎么做），然后再开始调用其它工具或派发子代理干活。
    - 纯问答无需调用工具时，直接输出正文作答即可；若需要调用任何工作工具（\`dispatch_subagent\`、读文件、改配置、调扩展等），请先调用 \`send_chat_message\` 回复用户，再紧接着执行其它工具（系统会强制拦截未先回复就悄悄跑工作工具的调用）。
 2. **你只是协调器，尽可能少亲自动手干重活**：
    - 一切写代码、建本地 WebUI、写实时扩展模块、读大型代码库、跑构建测试、批量处理文件、复杂调研等具体活计，**一律通过 \`dispatch_subagent\` 交给子代理去完成**，你只负责听懂用户意图、交代清晰任务、回收结果并给用户解释清楚。
@@ -53,6 +57,8 @@ export function buildCoordinatorSystemPrompt(
 - 已登记模型:
 ${modelLines.length > 0 ? modelLines.join("\n") : "- （暂无）"}
 - 已热加载的扩展工具: ${loadedExtensionNames.length > 0 ? loadedExtensionNames.join(", ") : "暂无"}
+- 最近子代理任务:
+${subagentLines.length > 0 ? subagentLines.join("\n") : "- （暂无）"}
 ${
   frozenSummary
     ? `\n# 更早对话的压缩记忆（已冻结上下文摘要）\n${frozenSummary}\n`

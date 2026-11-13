@@ -9,7 +9,7 @@ import type { ToolDefinition } from "../llm/types.js";
 import type { AttachmentStore } from "../storage/attachment-store.js";
 import type { ChatStore } from "../storage/chat-store.js";
 import type { ContextStore } from "../storage/context-store.js";
-import type { ExtensionExecutionContext, ProviderKind } from "../types.js";
+import type { ExtensionExecutionContext, ProviderKind, SubagentRunRecord } from "../types.js";
 import type { SubagentManager, SubagentToolExecutor } from "./subagent.js";
 
 const execAsync = promisify(exec);
@@ -22,7 +22,11 @@ export interface ToolRuntimeDeps {
   extensionLoader: ExtensionLoader;
   snapshotManager: SnapshotManager;
   subagentManager: SubagentManager;
+  /** Coordinator turn signal (aborted when a new user message interrupts Coordinator) */
   signal?: AbortSignal;
+  /** Daemon shutdown signal (subagents keep running across Coordinator turn interrupts) */
+  subagentSignal?: AbortSignal;
+  onDetachedSubagentFinished?: (run: SubagentRunRecord) => void;
   onTriggerCompaction: () => Promise<string>;
   onRelayConfigUpdated?: () => void;
   getRelayConnected?: () => boolean;
@@ -561,13 +565,21 @@ export async function executeCoordinatorTool(
       if (!profile) {
         throw new Error("No valid model profile configured for subagent.");
       }
+      const turnSignal = deps.signal;
+      const subagentSignal = deps.subagentSignal;
       const run = await deps.subagentManager.runTask({
         label,
         task,
         profile,
-        tools: buildSubagentToolExecutor(deps),
-        signal: deps.signal,
+        tools: buildSubagentToolExecutor({
+          ...deps,
+          signal: subagentSignal,
+        }),
+        signal: subagentSignal,
       });
+      if (turnSignal?.aborted && !subagentSignal?.aborted) {
+        deps.onDetachedSubagentFinished?.(run);
+      }
       return JSON.stringify(run, null, 2);
     }
 

@@ -6,7 +6,7 @@ import { toAssistantLlmMessage, type LlmImagePart, type LlmMessage } from "../ll
 import type { AttachmentStore } from "../storage/attachment-store.js";
 import type { ChatStore } from "../storage/chat-store.js";
 import { ContextStore, estimateTokens } from "../storage/context-store.js";
-import type { ChatMessage } from "../types.js";
+import type { ChatMessage, SubagentRunRecord } from "../types.js";
 import { buildCoordinatorSystemPrompt } from "./prompts.js";
 import type { SubagentManager } from "./subagent.js";
 import {
@@ -64,6 +64,8 @@ export class CoordinatorEngine {
   private idleTimer: NodeJS.Timeout | undefined;
   private activeRunPromise: Promise<void> | undefined;
   private abortController: AbortController | undefined;
+  private shutdownController = new AbortController();
+  private pendingSubagentCompletions: SubagentRunRecord[] = [];
   private compactionPromise: Promise<string> | undefined;
 
   constructor(
@@ -83,6 +85,9 @@ export class CoordinatorEngine {
 
   startBackgroundLoops(): void {
     this.stopped = false;
+    if (this.shutdownController.signal.aborted) {
+      this.shutdownController = new AbortController();
+    }
     if (this.idleTimer) return;
     this.idleTimer = setInterval(() => {
       void this.checkIdleCompaction();
@@ -93,16 +98,19 @@ export class CoordinatorEngine {
   async stop(): Promise<void> {
     this.stopped = true;
     this.rerunRequested = false;
+    this.pendingSubagentCompletions = [];
     this.stopBackgroundLoops();
     if (this.abortController) {
       this.abortController.abort();
     }
+    this.shutdownController.abort();
     if (this.activeRunPromise) {
       await this.activeRunPromise.catch(() => {});
     }
     if (this.compactionPromise) {
       await this.compactionPromise.catch(() => {});
     }
+    await this.deps.subagentManager.waitForAll();
   }
 
   stopBackgroundLoops(): void {
@@ -150,10 +158,26 @@ export class CoordinatorEngine {
     });
   }
 
+  private handleDetachedSubagentFinished(run: SubagentRunRecord): void {
+    if (this.stopped || this.shutdownController.signal.aborted) return;
+    this.pendingSubagentCompletions.push(run);
+    this.lastActivityAt = Date.now();
+    if (this.running) {
+      // Wait for current Coordinator turn to finish naturally instead of interrupting it
+      this.rerunRequested = true;
+      return;
+    }
+    this.activeRunPromise = this.runLoop().finally(() => {
+      this.activeRunPromise = undefined;
+    });
+  }
+
   private createToolDeps(signal?: AbortSignal): ToolRuntimeDeps {
     return {
       ...this.deps,
       signal,
+      subagentSignal: this.shutdownController.signal,
+      onDetachedSubagentFinished: (run) => this.handleDetachedSubagentFinished(run),
       onTriggerCompaction: () => this.compactContext("manual"),
     };
   }
@@ -230,6 +254,31 @@ export class CoordinatorEngine {
         }
       }
 
+      const detachedRuns = this.pendingSubagentCompletions.splice(0);
+      if (detachedRuns.length > 0) {
+        const summaryBlock = detachedRuns
+          .map(
+            (r) =>
+              `- id=${r.id} | label=${r.label} | status=${r.status}\n` +
+              `  task=${r.task}\n` +
+              `  result=${r.resultSummary ?? r.error ?? "(none)"}`
+          )
+          .join("\n");
+        const noticeText =
+          `[系统后台通知：你此前派发并在打断后继续后台运行的子代理已执行完毕]\n` +
+          `${summaryBlock}\n` +
+          `请结合最新对话上下文向用户简明汇报结果，或按用户最新指示处理后续事项。`;
+        const prev = llmMessages[llmMessages.length - 1];
+        if (prev && prev.role === "user") {
+          prev.content = [prev.content, noticeText].filter(Boolean).join("\n\n");
+        } else {
+          llmMessages.push({
+            role: "user",
+            content: noticeText,
+          });
+        }
+      }
+
       if (llmMessages.length === 0) return;
       if (this.stopped || this.rerunRequested || abortController.signal.aborted) return;
 
@@ -252,7 +301,8 @@ export class CoordinatorEngine {
           currentConfig,
           loadedExtensions,
           this.deps.contextStore.getState().frozenSummary,
-          this.deps.configStore.paths
+          this.deps.configStore.paths,
+          this.deps.subagentManager.listRuns(6)
         );
 
         const tools = getCoordinatorToolDefinitions(this.deps.extensionLoader);
