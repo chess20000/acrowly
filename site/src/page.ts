@@ -52,7 +52,7 @@ export function renderLandingPage(): string {
 </head>
 <body>
   <h1>Acr0w/y</h1>
-  <p>无头个人 AI 协调器。复制发给你电脑上的 Agent 即可安装（本页仅作入口，非核心依赖）：</p>
+  <p>你的个人助手。复制发给你电脑上的 Agent 即可安装。</p>
   <pre id="p">${INSTALL_PROMPT}</pre>
   <button id="b" type="button">复制 Prompt</button>
   <div class="links">
