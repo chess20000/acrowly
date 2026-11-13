@@ -72,13 +72,23 @@ export interface AcrowlyConfig {
   server: ServerConfig;
 }
 
+export type MessageOrigin = "human" | "coordinator" | "subagent" | "extension" | "tool" | "system";
+
 export interface ChatMessage {
   seq: number;
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   text: string;
   createdAt: string;
   clientMsgId?: string;
+  /**
+   * Who actually produced this timeline entry.
+   * Absent on legacy rows: role user is human, role assistant is the coordinator.
+   * Tool, subagent, and extension injections must never use role user / origin human.
+   */
+  origin?: MessageOrigin;
+  /** Subagent label, extension tool name, or other actor id. */
+  actor?: string;
 }
 
 export interface StoredFileMeta {
@@ -104,7 +114,7 @@ export interface SubagentRunRecord {
   label: string;
   task: string;
   modelAlias: string;
-  status: "running" | "completed" | "failed";
+  status: "running" | "completed" | "failed" | "step_limit";
   startedAt: string;
   finishedAt?: string;
   resultSummary?: string;

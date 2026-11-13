@@ -1,7 +1,5 @@
-import { exec } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 import { writeFileAtomic, type ConfigStore } from "../config/store.js";
 import type { ExtensionLoader } from "../extensions/loader.js";
 import type { SnapshotManager } from "../extensions/snapshot.js";
@@ -10,9 +8,16 @@ import type { AttachmentStore } from "../storage/attachment-store.js";
 import type { ChatStore } from "../storage/chat-store.js";
 import type { ContextStore } from "../storage/context-store.js";
 import type { ExtensionExecutionContext, ProviderKind, SubagentRunRecord } from "../types.js";
+import { createActor, currentActor, releaseActor, runWithActor } from "./actor.js";
+import {
+  formatUserVisibleReply,
+  reviewCoordinatorReply,
+  type TurnEvidence,
+} from "./reply-policy.js";
+import { runShellCommand } from "./shell-runner.js";
 import type { SubagentManager, SubagentToolExecutor } from "./subagent.js";
 
-const execAsync = promisify(exec);
+export { stripCoordinatorMarkdown } from "./reply-policy.js";
 
 export interface ToolRuntimeDeps {
   configStore: ConfigStore;
@@ -31,6 +36,8 @@ export interface ToolRuntimeDeps {
   onTriggerCompaction: () => Promise<string>;
   onRelayConfigUpdated?: () => void;
   getRelayConnected?: () => boolean;
+  /** Mutable evidence for the coordinator turn that invoked the tool. */
+  turn?: TurnEvidence;
 }
 
 const SUBAGENT_TOOL_DEFS: ToolDefinition[] = [
@@ -163,6 +170,10 @@ const COORDINATOR_BASE_TOOL_DEFS: ToolDefinition[] = [
         modelAlias: {
           type: "string",
           description: "Optional registered model alias to run this subagent on.",
+        },
+        maxSteps: {
+          type: "number",
+          description: "Optional step cap (1-40). Default 25. Hitting it stops the run as unfinished.",
         },
       },
       required: ["label", "task"],
@@ -384,7 +395,16 @@ export function createExtensionContext(deps: ToolRuntimeDeps): ExtensionExecutio
       };
     },
     sendMessage: async (text) => {
-      const { message } = await deps.chatStore.appendMessage({ role: "assistant", text });
+      const actor = currentActor();
+      const evidence = deps.turn ?? { humanRequestSeq: 0, incomplete: false };
+      const decision = reviewCoordinatorReply(text, evidence, deps.chatStore.getAllMessages());
+      const visible = decision.blocked ? decision.fallback : decision.text;
+      const { message } = await deps.chatStore.appendMessage({
+        role: "assistant",
+        origin: "extension",
+        actor: actor?.label ?? "extension",
+        text: visible || "（空消息）",
+      });
       return message;
     },
   };
@@ -406,31 +426,29 @@ async function executeHostTool(
     case "run_shell": {
       const command = String(args.command ?? "");
       const cwd = resolvePath(rootDir, args.cwd);
-      const timeoutMs = Math.min(Math.max(Number(args.timeoutMs ?? 60_000), 1000), 300_000);
       try {
-        const { stdout, stderr } = await execAsync(command, {
+        const actorLabel = currentActor()?.label;
+        const result = await runShellCommand({
+          command,
           cwd,
-          timeout: timeoutMs,
-          maxBuffer: 4 * 1024 * 1024,
-          shell: process.platform === "win32" ? "powershell.exe" : "/bin/sh",
+          timeoutMs: typeof args.timeoutMs === "number" ? args.timeoutMs : undefined,
           signal: deps.signal,
+          markIncomplete: () => {
+            if (deps.turn) deps.turn.incomplete = true;
+          },
+          onBackgroundSettled: async (text) => {
+            await deps.chatStore.appendMessage({
+              role: "system",
+              origin: "system",
+              ...(actorLabel ? { actor: actorLabel } : {}),
+              text,
+            });
+          },
         });
-        const combined = [
-          stdout ? `STDOUT:\n${stdout}` : "",
-          stderr ? `STDERR:\n${stderr}` : "",
-        ]
-          .filter(Boolean)
-          .join("\n");
-        return (combined || "(Command exited with code 0, no output.)").slice(0, 16_000);
+        return result.output;
       } catch (err) {
-        if (deps.signal?.aborted) {
-          throw err;
-        }
-        const e = err as { code?: number; stdout?: string; stderr?: string; message?: string };
-        return `EXIT ${e.code ?? 1}\n${e.message ?? ""}\nSTDOUT:\n${e.stdout ?? ""}\nSTDERR:\n${e.stderr ?? ""}`.slice(
-          0,
-          16_000
-        );
+        if (deps.signal?.aborted) throw err;
+        return `EXIT 1\n${err instanceof Error ? err.message : String(err)}`.slice(0, 16_000);
       }
     }
 
@@ -554,33 +572,6 @@ export function buildSubagentToolExecutor(deps: ToolRuntimeDeps): SubagentToolEx
   };
 }
 
-export function stripCoordinatorMarkdown(input: string): string {
-  let text = input.replace(/\r\n/g, "\n");
-  // Fenced code blocks -> inner content
-  text = text.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_m, inner: string) => inner.trim());
-  // Inline code -> inner text
-  text = text.replace(/`([^`\n]+)`/g, "$1");
-  // Markdown images ![alt](url) -> plain text + url
-  text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_m, alt: string, url: string) =>
-    alt.trim() ? `${alt.trim()} ${url}` : url
-  );
-  // Markdown links [label](url) -> plain text (avoid breaking raw paths)
-  text = text.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, label: string, url: string) =>
-    label.trim() === url.trim() ? url : `${label.trim()} (${url})`
-  );
-  // ATX headings & blockquotes
-  text = text.replace(/^\s{0,3}#{1,6}\s+/gm, "");
-  text = text.replace(/^\s*>\s?/gm, "");
-  // Unordered list bullets & horizontal rules
-  text = text.replace(/^\s*[-*+]\s+/gm, "");
-  text = text.replace(/^\s*([-*_])\1{2,}\s*$/gm, "");
-  // Bold / italic wrappers (leave intra-word underscores like file_123 intact)
-  text = text.replace(/\*\*([^*\n]+)\*\*/g, "$1");
-  text = text.replace(/__([^_\n]+)__/g, "$1");
-  text = text.replace(/(^|[^\w*])\*([^*\n]+)\*(?=[^\w*]|$)/g, "$1$2");
-  return text.replace(/\n{3,}/g, "\n\n").trim();
-}
-
 export function getCoordinatorToolDefinitions(extensionLoader: ExtensionLoader): ToolDefinition[] {
   const extDefs: ToolDefinition[] = extensionLoader.getTools().map((t) => ({
     name: t.name,
@@ -597,9 +588,17 @@ export async function executeCoordinatorTool(
 ): Promise<string> {
   const config = deps.configStore.getConfig();
 
-  // Check dynamically loaded extension tools first
+  // Check dynamically loaded extension tools first. Their loopback chat posts
+  // carry this actor token so they cannot land as the user's own messages.
   if (deps.extensionLoader.getTool(name)) {
-    return deps.extensionLoader.executeTool(name, args, createExtensionContext(deps));
+    const actor = createActor("extension", name);
+    try {
+      return await runWithActor(actor, () =>
+        deps.extensionLoader.executeTool(name, args, createExtensionContext(deps))
+      );
+    } finally {
+      releaseActor(actor);
+    }
   }
 
   switch (name) {
@@ -616,20 +615,51 @@ export async function executeCoordinatorTool(
       }
       const turnSignal = deps.signal;
       const subagentSignal = deps.subagentSignal;
-      const run = await deps.subagentManager.runTask({
-        label,
-        task,
-        profile,
-        tools: buildSubagentToolExecutor({
-          ...deps,
-          signal: subagentSignal,
-        }),
-        signal: subagentSignal,
-      });
-      if (turnSignal?.aborted && !subagentSignal?.aborted) {
-        deps.onDetachedSubagentFinished?.(run);
+      const maxSteps =
+        typeof args.maxSteps === "number" && Number.isFinite(args.maxSteps)
+          ? Math.min(40, Math.max(1, Math.floor(args.maxSteps)))
+          : undefined;
+      const actor = createActor("subagent", label);
+      try {
+        const run = await runWithActor(actor, () =>
+          deps.subagentManager.runTask({
+            label,
+            task,
+            profile,
+            tools: buildSubagentToolExecutor({
+              ...deps,
+              signal: subagentSignal,
+            }),
+            signal: subagentSignal,
+            ...(maxSteps !== undefined ? { maxSteps } : {}),
+            onTerminal: async (finished) => {
+              if (deps.turn) deps.turn.incomplete = true;
+              const detail =
+                finished.status === "step_limit"
+                  ? `子代理 ${finished.label} 到了步数上限，停了，任务没完成。`
+                  : `子代理 ${finished.label} 失败了，卡在：${(finished.error ?? "未知错误").replace(/\s+/g, " ")}`;
+              await deps.chatStore.appendMessage({
+                role: "system",
+                origin: "system",
+                actor: finished.label,
+                text: formatUserVisibleReply(detail),
+              });
+            },
+          })
+        );
+        if (
+          deps.turn &&
+          (run.status === "step_limit" || (run.status === "failed" && run.error !== "Interrupted"))
+        ) {
+          deps.turn.incomplete = true;
+        }
+        if (turnSignal?.aborted && !subagentSignal?.aborted) {
+          deps.onDetachedSubagentFinished?.(run);
+        }
+        return JSON.stringify(run, null, 2);
+      } finally {
+        releaseActor(actor);
       }
-      return JSON.stringify(run, null, 2);
     }
 
     case "list_subagents": {
@@ -638,10 +668,22 @@ export async function executeCoordinatorTool(
     }
 
     case "send_chat_message": {
-      const text = stripCoordinatorMarkdown(String(args.text ?? ""));
-      if (!text) return JSON.stringify({ skipped: true });
-      const { message } = await deps.chatStore.appendMessage({ role: "assistant", text });
-      return JSON.stringify({ sent: true, seq: message.seq, id: message.id });
+      const decision = reviewCoordinatorReply(
+        String(args.text ?? ""),
+        deps.turn ?? { humanRequestSeq: 0, incomplete: false },
+        deps.chatStore.getAllMessages()
+      );
+      if (decision.blocked) {
+        if (deps.turn) deps.turn.honestFallback = decision.fallback;
+        return decision.reason;
+      }
+      if (!decision.text) return JSON.stringify({ skipped: true });
+      const { message } = await deps.chatStore.appendMessage({
+        role: "assistant",
+        origin: "coordinator",
+        text: decision.text,
+      });
+      return JSON.stringify({ sent: true, seq: message.seq, id: message.id, text: message.text });
     }
 
     case "get_system_status": {
@@ -858,7 +900,7 @@ export async function executeCoordinatorTool(
     }
 
     case "restart_service": {
-      const reason = typeof args.reason === "string" ? stripCoordinatorMarkdown(args.reason) : "";
+      const reason = typeof args.reason === "string" ? formatUserVisibleReply(args.reason) : "";
       const force = args.force === true;
       if (!force) {
         const running = deps.subagentManager.listRuns(50).filter((r) => r.status === "running");
@@ -878,7 +920,8 @@ export async function executeCoordinatorTool(
       );
       await deps.chatStore.appendMessage({
         role: "assistant",
-        text: "正在重启服务加载新代码，1~2 秒后自动恢复。",
+        origin: "coordinator",
+        text: formatUserVisibleReply("正在重启服务加载新代码，1~2 秒后自动恢复。"),
       });
       deps.onRequestRestart(reason);
       return JSON.stringify({ restarting: true, reason });
