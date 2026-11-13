@@ -4,26 +4,6 @@ import path from "node:path";
 import type { StoredFileMeta } from "../types.js";
 import { writeFileAtomic } from "../config/store.js";
 
-const VIDEO_EXTENSIONS = new Set([
-  ".mp4",
-  ".mov",
-  ".mkv",
-  ".avi",
-  ".webm",
-  ".flv",
-  ".m4v",
-  ".wmv",
-  ".3gp",
-  ".3g2",
-  ".mpeg",
-  ".mpg",
-  ".ts",
-  ".mts",
-  ".m2ts",
-  ".ogv",
-  ".vob",
-]);
-
 const IMAGE_EXTENSIONS_TO_MIME: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -41,44 +21,52 @@ const IMAGE_EXTENSIONS_TO_MIME: Record<string, string> = {
 const FILE_EXTENSIONS_TO_MIME: Record<string, string> = {
   ".txt": "text/plain; charset=utf-8",
   ".md": "text/markdown; charset=utf-8",
+  ".log": "text/plain; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".csv": "text/csv; charset=utf-8",
+  ".xml": "application/xml; charset=utf-8",
+  ".yaml": "application/yaml; charset=utf-8",
+  ".yml": "application/yaml; charset=utf-8",
   ".pdf": "application/pdf",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".ppt": "application/vnd.ms-powerpoint",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   ".zip": "application/zip",
   ".tar": "application/x-tar",
   ".gz": "application/gzip",
+  ".7z": "application/x-7z-compressed",
+  ".rar": "application/vnd.rar",
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".ts": "text/plain; charset=utf-8",
   ".py": "text/plain; charset=utf-8",
+  ".mp4": "video/mp4",
+  ".mov": "video/quicktime",
+  ".m4v": "video/x-m4v",
+  ".mkv": "video/x-matroska",
+  ".avi": "video/x-msvideo",
+  ".webm": "video/webm",
+  ".flv": "video/x-flv",
+  ".wmv": "video/x-ms-wmv",
+  ".3gp": "video/3gpp",
+  ".3g2": "video/3gpp2",
+  ".mpeg": "video/mpeg",
+  ".mpg": "video/mpeg",
+  ".ogv": "video/ogg",
+  ".vob": "video/dvd",
+  ".mts": "video/mp2t",
+  ".m2ts": "video/mp2t",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".m4a": "audio/mp4",
+  ".aac": "audio/aac",
+  ".ogg": "audio/ogg",
+  ".opus": "audio/opus",
+  ".flac": "audio/flac",
 };
-
-// Note: `.ts` can be TypeScript source code when text, so inspect content/MIME before blocking `.ts` as MPEG-TS!
-const VIDEO_FTYP_BRANDS = new Set([
-  "isom",
-  "iso2",
-  "iso5",
-  "iso6",
-  "mp41",
-  "mp42",
-  "avc1",
-  "hvc1",
-  "qt  ",
-  "m4v ",
-  "M4V ",
-  "3gp4",
-  "3gp5",
-  "3gp6",
-  "3g2a",
-  "f4v ",
-]);
-
-export class VideoRejectedError extends Error {
-  constructor(reason: string) {
-    super(reason);
-    this.name = "VideoRejectedError";
-  }
-}
 
 export function sanitizeFilename(filename: string): string {
   const base = path.basename(filename || "file").replace(/[\r\n\0/\\]+/g, "_");
@@ -94,60 +82,10 @@ function looksLikeText(buf: Buffer): boolean {
   return true;
 }
 
-export function assertNotVideo(filename: string, mime: string, data: Buffer): void {
-  const lowerMime = mime.toLowerCase().trim();
-  if (lowerMime.startsWith("video/")) {
-    throw new VideoRejectedError("Video MIME types are not supported.");
-  }
-
-  const ext = path.extname(filename).toLowerCase();
-  if (ext === ".ts") {
-    // Allow TypeScript files (`text/*` or UTF-8 text without MPEG-TS 0x47 sync bytes every 188 bytes)
-    const isMpegTsSync =
-      data.length >= 377 && data[0] === 0x47 && data[188] === 0x47 && data[376] === 0x47;
-    if (isMpegTsSync || !looksLikeText(data)) {
-      throw new VideoRejectedError("MPEG-TS video streams are not supported.");
-    }
-  } else if (VIDEO_EXTENSIONS.has(ext)) {
-    throw new VideoRejectedError(`Video file extension (${ext}) is not supported.`);
-  }
-
-  // Magic-byte inspection
-  if (data.length >= 12) {
-    // ISO Base Media File Format (`ftyp`)
-    if (data.subarray(4, 8).toString("ascii") === "ftyp") {
-      const brand = data.subarray(8, 12).toString("ascii");
-      if (VIDEO_FTYP_BRANDS.has(brand) || brand.toLowerCase().startsWith("3gp")) {
-        throw new VideoRejectedError(`Video container (${brand.trim()}) is not supported.`);
-      }
-    }
-
-    // RIFF .... AVI
-    if (
-      data.subarray(0, 4).toString("ascii") === "RIFF" &&
-      data.subarray(8, 12).toString("ascii") === "AVI "
-    ) {
-      throw new VideoRejectedError("AVI video files are not supported.");
-    }
-
-    // FLV\x01
-    if (data.subarray(0, 3).toString("ascii") === "FLV" && data[3] === 0x01) {
-      throw new VideoRejectedError("FLV video files are not supported.");
-    }
-
-    // EBML header (Matroska / WebM)
-    if (data[0] === 0x1a && data[1] === 0x45 && data[2] === 0xdf && data[3] === 0xa3) {
-      const head = data.subarray(0, Math.min(data.length, 64)).toString("latin1").toLowerCase();
-      if (head.includes("webm") || head.includes("matroska")) {
-        throw new VideoRejectedError("WebM/MKV video files are not supported.");
-      }
-    }
-  }
-}
-
 export function inferMimeAndKind(
   filename: string,
-  declaredMime?: string
+  declaredMime?: string,
+  data?: Buffer
 ): { mime: string; kind: "image" | "file" } {
   const ext = path.extname(filename).toLowerCase();
   const cleanDeclared = declaredMime?.split(";")[0]?.trim().toLowerCase();
@@ -158,6 +96,14 @@ export function inferMimeAndKind(
 
   if (IMAGE_EXTENSIONS_TO_MIME[ext]) {
     return { mime: IMAGE_EXTENSIONS_TO_MIME[ext], kind: "image" };
+  }
+
+  if (ext === ".ts" && (!cleanDeclared || cleanDeclared === "application/octet-stream")) {
+    // Distinguish TypeScript source text from binary MPEG-TS video streams
+    if (!data || looksLikeText(data)) {
+      return { mime: "text/plain; charset=utf-8", kind: "file" };
+    }
+    return { mime: "video/mp2t", kind: "file" };
   }
 
   if (cleanDeclared && cleanDeclared !== "application/octet-stream") {
@@ -209,9 +155,7 @@ export class AttachmentStore {
     data: Buffer;
   }): Promise<StoredFileMeta & { url: string; markdown: string }> {
     const safeName = sanitizeFilename(input.filename);
-    assertNotVideo(safeName, input.declaredMime ?? "", input.data);
-
-    const { mime, kind } = inferMimeAndKind(safeName, input.declaredMime);
+    const { mime, kind } = inferMimeAndKind(safeName, input.declaredMime, input.data);
     const id = `file_${Date.now().toString(36)}_${crypto.randomBytes(4).toString("hex")}`;
     const ext = path.extname(safeName);
     const storedName = `${id}${ext}`;
@@ -269,14 +213,46 @@ export class AttachmentStore {
   }
 }
 
-export function parseMultipartSingleFile(
+export interface ParsedMultipartFile {
+  fieldName: string;
+  filename: string;
+  mime: string;
+  data: Buffer;
+}
+
+export interface ParsedMultipartFormData {
+  fields: Record<string, string>;
+  files: ParsedMultipartFile[];
+}
+
+function parseDispositionFilename(dispositionLine: string): { hasFilename: boolean; filename: string } {
+  const starMatch = dispositionLine.match(/filename\*\s*=\s*(?:utf-8''|UTF-8'')([^;\r\n]+)/i);
+  if (starMatch) {
+    const raw = starMatch[1].trim().replace(/^"(.*)"$/, "$1");
+    try {
+      return { hasFilename: true, filename: decodeURIComponent(raw) };
+    } catch {
+      return { hasFilename: true, filename: raw };
+    }
+  }
+  const plainMatch = dispositionLine.match(/;\s*filename="([^"]*)"/i);
+  if (plainMatch) {
+    return { hasFilename: true, filename: plainMatch[1] };
+  }
+  return { hasFilename: false, filename: "" };
+}
+
+export function parseMultipartFormData(
   body: Buffer,
   contentType: string
-): { filename: string; mime: string; data: Buffer } | undefined {
+): ParsedMultipartFormData | undefined {
   const match = contentType.match(/boundary=(?:"([^"]+)"|([^;\s]+))/i);
   if (!match) return undefined;
   const boundary = match[1] ?? match[2];
   const boundaryBuf = Buffer.from(`--${boundary}`);
+
+  const fields: Record<string, string> = {};
+  const files: ParsedMultipartFile[] = [];
 
   let start = body.indexOf(boundaryBuf);
   while (start !== -1) {
@@ -296,8 +272,15 @@ export function parseMultipartSingleFile(
 
     const headerEndCrlf = part.indexOf(Buffer.from("\r\n\r\n"));
     const headerEndLf = part.indexOf(Buffer.from("\n\n"));
-    const headerEnd = headerEndCrlf !== -1 ? headerEndCrlf : headerEndLf;
-    const sepLen = headerEndCrlf !== -1 ? 4 : 2;
+    let headerEnd = -1;
+    let sepLen = 0;
+    if (headerEndCrlf !== -1 && (headerEndLf === -1 || headerEndCrlf < headerEndLf)) {
+      headerEnd = headerEndCrlf;
+      sepLen = 4;
+    } else if (headerEndLf !== -1) {
+      headerEnd = headerEndLf;
+      sepLen = 2;
+    }
     if (headerEnd === -1) {
       start = nextBoundary;
       continue;
@@ -311,18 +294,28 @@ export function parseMultipartSingleFile(
       data = data.subarray(0, data.length - 1);
     }
 
-    const filenameMatch = headersText.match(/filename="([^"]*)"/i);
-    if (filenameMatch) {
+    const nameMatch = headersText.match(/content-disposition:[^\r\n]*;\s*name="([^"]*)"/i);
+    const fieldName = nameMatch?.[1] ?? "";
+    const { hasFilename, filename } = parseDispositionFilename(headersText);
+
+    if (hasFilename) {
+      if (filename === "" && data.length === 0) {
+        start = nextBoundary;
+        continue;
+      }
       const mimeMatch = headersText.match(/content-type:\s*([^\r\n;]+)/i);
-      return {
-        filename: filenameMatch[1] || "upload.bin",
+      files.push({
+        fieldName: fieldName || "file",
+        filename: filename || "upload.bin",
         mime: mimeMatch ? mimeMatch[1].trim() : "application/octet-stream",
         data,
-      };
+      });
+    } else if (fieldName) {
+      fields[fieldName] = data.toString("utf8");
     }
 
     start = nextBoundary;
   }
 
-  return undefined;
+  return { fields, files };
 }

@@ -166,12 +166,7 @@ export class CoordinatorEngine {
 
     for (const msg of refreshedWindow.activeMessages) {
       if (msg.role === "user") {
-        const images = await this.hydrateImages(msg.text);
-        llmMessages.push({
-          role: "user",
-          content: msg.text,
-          ...(images.length > 0 ? { images } : {}),
-        });
+        llmMessages.push(await this.buildLlmUserMessage(msg.text));
       } else {
         llmMessages.push({
           role: "assistant",
@@ -311,44 +306,59 @@ export class CoordinatorEngine {
     for (const msg of messages) {
       if (msg.seq > maxSeq) maxSeq = msg.seq;
       if (msg.role === "user") {
-        const images = await this.hydrateImages(msg.text);
-        llmMessages.push({
-          role: "user",
-          content: msg.text,
-          ...(images.length > 0 ? { images } : {}),
-        });
+        llmMessages.push(await this.buildLlmUserMessage(msg.text));
       }
     }
     return { newLastSeq: maxSeq };
   }
 
-  private async hydrateImages(text: string): Promise<LlmImagePart[]> {
+  private async buildLlmUserMessage(text: string): Promise<LlmMessage> {
     const matches = Array.from(text.matchAll(FILE_REF_REGEX));
-    if (matches.length === 0) return [];
+    if (matches.length === 0) {
+      return { role: "user", content: text };
+    }
 
     const seen = new Set<string>();
     const images: LlmImagePart[] = [];
+    const attachmentLines: string[] = [];
 
     for (const match of matches) {
       const fileId = match[1];
       if (!fileId || seen.has(fileId)) continue;
       seen.add(fileId);
 
-      const loaded = await this.deps.attachmentStore.readFileBuffer(fileId);
-      if (!loaded) continue;
+      const meta = this.deps.attachmentStore.getMeta(fileId);
+      if (!meta) continue;
+
+      attachmentLines.push(
+        `- ${meta.name} | kind=${meta.kind} | mime=${meta.mime} | size=${meta.size} bytes | localPath=${meta.storedPath}`
+      );
+
       if (
-        loaded.meta.kind === "image" &&
-        SUPPORTED_VISION_MIMES.has(loaded.meta.mime) &&
-        loaded.data.length <= 8 * 1024 * 1024
+        meta.kind === "image" &&
+        SUPPORTED_VISION_MIMES.has(meta.mime) &&
+        meta.size <= 8 * 1024 * 1024
       ) {
-        images.push({
-          mime: loaded.meta.mime,
-          base64: loaded.data.toString("base64"),
-        });
+        const loaded = await this.deps.attachmentStore.readFileBuffer(fileId);
+        if (loaded) {
+          images.push({
+            mime: meta.mime,
+            base64: loaded.data.toString("base64"),
+          });
+        }
       }
     }
 
-    return images;
+    const content =
+      attachmentLines.length > 0
+        ? `${text}\n\n[附件元信息]\n${attachmentLines.join("\n")}`
+        : text;
+
+    return {
+      role: "user",
+      content,
+      ...(images.length > 0 ? { images } : {}),
+    };
   }
 
   private async checkIdleCompaction(): Promise<void> {

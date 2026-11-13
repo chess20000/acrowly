@@ -1,6 +1,6 @@
 # Acrowly Pure Chat API Specification
 
-> **Design Philosophy**: Minimalist, zero-GUI headless agent API. The chat channel transmits **pure conversation text only** (just like real humans texting). Images and files are uploaded separately and referenced inside message text as Markdown links. **Video is strictly unsupported and rejected.**
+> **Design Philosophy**: Minimalist, zero-GUI headless agent API. The single continuous chat timeline transfers conversation messages and embeds **any type of file** (images, documents, archives, code, audio, video, etc.) seamlessly — clients can either upload files directly alongside text in `POST /api/chat/messages` (`multipart/form-data`), or upload separately via `POST /api/files` and include the returned Markdown links in JSON messages.
 
 ---
 
@@ -108,25 +108,40 @@ Fetch chat history from the single continuous timeline.
 ```
 
 ### `POST /api/chat/messages`
-Send a user message into the conversation. Returns immediately (`202 Accepted`) without blocking on Coordinator reasoning or subagent work.
-- Request JSON:
+Send a user message (text, files, or both) into the conversation. Returns immediately (`202 Accepted`) without blocking on Coordinator reasoning or subagent work.
+- **Mode A — JSON text** (`Content-Type: application/json`):
 ```json
 {
   "text": "帮我写一个极简的本地网页前端",
   "clientMsgId": "optional-client-uuid-for-idempotency"
 }
 ```
-- Response (`202 Accepted` or `200 OK` if deduplicated):
+- **Mode B — Direct Multipart Upload** (`Content-Type: multipart/form-data`):
+  - Form text fields: `text` (optional if at least one file is uploaded), `clientMsgId` (optional)
+  - File parts: one or more file fields (e.g. `file` / `files`) of **any file type** (images, PDFs, documents, archives, code, audio, video, binaries — up to `100 MB` per request)
+  - All uploaded files are stored cleanly in `/api/files/...`, their Markdown links (`![name](url)` / `[name](url)`) are appended into `message.text`, and the Coordinator automatically receives `[附件元信息]` with each file's MIME type, size, and local disk path (`localPath`) so both Coordinator and subagents can inspect/process any file directly.
+- Response (`202 Accepted` or `200 OK` if deduplicated; includes `attachments` when files were uploaded directly via multipart):
 ```json
 {
   "message": {
     "seq": 13,
     "id": "msg_...",
     "role": "user",
-    "text": "帮我写一个极简的本地网页前端",
+    "text": "帮我分析下这个文件\n[report.pdf](/api/files/file_.../report.pdf)",
     "createdAt": "2026-11-13T06:26:00.000Z"
   },
-  "duplicate": false
+  "duplicate": false,
+  "attachments": [
+    {
+      "id": "file_...",
+      "kind": "file",
+      "name": "report.pdf",
+      "mime": "application/pdf",
+      "size": 24576,
+      "url": "/api/files/file_.../report.pdf",
+      "markdown": "[report.pdf](/api/files/file_.../report.pdf)"
+    }
+  ]
 }
 ```
 
@@ -145,12 +160,11 @@ data: {"seq":14,"id":"msg_...","role":"assistant","text":"收到，我让子代�
 
 ---
 
-## 4. Images & Files Endpoints (No Video)
+## 4. Arbitrary File & Media Endpoints (Images, Documents, Audio, Video, Binaries)
 
 ### `POST /api/files`
-Upload an image or non-video file.
-- Accepts `multipart/form-data` with field `file`, OR raw binary body with `X-Filename` and `Content-Type` headers.
-- **Video Rejection**: Any `video/*` MIME type, video file extension (`.mp4`, `.mov`, `.mkv`, `.avi`, `.webm`, `.flv`, `.m4v`, `.wmv`, `.3gp`, `.mpeg`, `.mpg`, `.ts`), or video container signature is rejected with `415 Unsupported Media Type`.
+Upload any file (no file-type restrictions; up to `100 MB` per request).
+- Accepts `multipart/form-data` (one or more file fields such as `file` / `files`), OR raw binary body with `X-Filename` and `Content-Type` headers.
 - Response (`201 Created`):
 ```json
 {
@@ -163,11 +177,13 @@ Upload an image or non-video file.
   "markdown": "![screenshot.png](/api/files/file_01J.../screenshot.png)"
 }
 ```
-- The client includes `markdown` directly inside `text` when calling `POST /api/chat/messages`.
+*(When multiple files are uploaded in a single multipart `/api/files` request, the response includes the first item's fields at top level plus `"files": [ ... ]` with every uploaded file.)*
+- Clients may either include `markdown` inside `POST /api/chat/messages` JSON `text`, OR skip this step and upload directly via `POST /api/chat/messages` `multipart/form-data`.
 
 ### `GET /api/files/:id` and `GET /api/files/:id/:filename`
-Retrieve an uploaded or Coordinator-generated image/file.
-- Supports `HttpOnly` session cookie (for `<img>` tags) and `Authorization: Bearer <token>` (for iOS App / scripts).
+Retrieve an uploaded or Coordinator-generated file.
+- Supports `HttpOnly` session cookie (for `<img>`, `<video>`, `<audio>`) and `Authorization: Bearer <token>` (for iOS App / scripts).
+- Serves `image/*`, `video/*`, and `audio/*` inline by default (supports HTTP `Range: bytes=...` -> `206 Partial Content`), and other files as `attachment`.
 - Append `?download=1` to force `Content-Disposition: attachment`.
 
 ---
@@ -178,6 +194,6 @@ When building or modifying `./webui/index.html`:
 1. **Zero dependencies / zero build step**: Write pure HTML + CSS + ES Module JS so changes take effect immediately on browser refresh.
 2. **Built-in Ed25519 keygen & challenge auth**: Use browser `crypto.subtle` (`Ed25519`) to generate and store a local keypair (`IndexedDB` / JWK); if unauthenticated (`401` on `/api/auth/challenge`), display the client's public key with a one-click Copy button so the user can authorize it with Coordinator, then complete `/api/auth/challenge` + `/api/auth/verify`.
 3. **Single chat interface only**: Display only the single continuous chat feed and message composer. No multi-session lists, no settings panels, no sidebars.
-4. **Supported media only**: Render text (safe Markdown), inline images (`<img>` from `/api/files/...`), and file download cards. Never add `<video>` rendering or video upload/recording controls; restrict file pickers away from `video/*`.
+4. **All files supported cleanly**: Render text (safe Markdown), inline images (`<img>` from `/api/files/...`), playable video/audio (`<video controls>`, `<audio controls>`), and file download cards for documents/archives/binaries. Do not block any file types in file pickers or drag-and-drop.
 5. **Cross-device responsive**: Must work comfortably on both desktop browsers and mobile screens (iPhone/Android Safari/Chrome).
-6. **Realtime sync**: Load initial messages via `GET ./api/chat/messages`, subscribe to `GET ./api/chat/stream?after_seq=...`, deduplicate by `seq`, send via `POST ./api/chat/messages`, and upload images/files (paste, drag-drop, or picker) via `POST ./api/files`. Resolve `/api/files/...` links cleanly even when hosted under `/d/<deviceId>/`.
+6. **Realtime sync**: Load initial messages via `GET ./api/chat/messages`, subscribe to `GET ./api/chat/stream?after_seq=...`, deduplicate by `seq`, send text + optional files via `POST ./api/chat/messages` (`application/json` or `multipart/form-data`) or `POST ./api/files`. Resolve `/api/files/...` links cleanly even when hosted under `/d/<deviceId>/`.

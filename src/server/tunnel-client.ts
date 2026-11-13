@@ -13,7 +13,7 @@ interface PendingTunnelRequest {
   closeListeners: Array<() => void>;
 }
 
-const MAX_TUNNEL_REQ_BYTES = 50 * 1024 * 1024;
+const MAX_TUNNEL_REQ_BYTES = 100 * 1024 * 1024;
 
 export class TunnelClient {
   private ws: WebSocket | undefined;

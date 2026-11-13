@@ -5,10 +5,10 @@ import type { CoordinatorEngine } from "../agent/coordinator.js";
 import type { ConfigStore } from "../config/store.js";
 import {
   AttachmentStore,
-  VideoRejectedError,
-  parseMultipartSingleFile,
+  parseMultipartFormData,
 } from "../storage/attachment-store.js";
 import type { ChatStore } from "../storage/chat-store.js";
+import type { StoredFileMeta } from "../types.js";
 import {
   AuthChallengeStore,
   AuthRateLimiter,
@@ -32,8 +32,71 @@ const STATIC_MIME_TYPES: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
-const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
+
+interface UploadedFileResponse {
+  id: string;
+  kind: "image" | "file";
+  name: string;
+  mime: string;
+  size: number;
+  url: string;
+  markdown: string;
+}
+
+function toUploadedFileResponse(
+  saved: StoredFileMeta & { url: string; markdown: string }
+): UploadedFileResponse {
+  return {
+    id: saved.id,
+    kind: saved.kind,
+    name: saved.name,
+    mime: saved.mime,
+    size: saved.size,
+    url: saved.url,
+    markdown: saved.markdown,
+  };
+}
+
+function parseByteRange(
+  rangeHeader: string,
+  totalLength: number
+): { start: number; end: number } | "invalid" | undefined {
+  const trimmed = rangeHeader.trim();
+  if (!trimmed.toLowerCase().startsWith("bytes=")) return undefined;
+  const spec = trimmed.slice("bytes=".length).trim();
+  if (!spec || spec.includes(",")) return undefined;
+
+  const dashIdx = spec.indexOf("-");
+  if (dashIdx === -1) return "invalid";
+  const startStr = spec.slice(0, dashIdx).trim();
+  const endStr = spec.slice(dashIdx + 1).trim();
+
+  if (totalLength <= 0) return "invalid";
+
+  let start: number;
+  let end: number;
+  if (!startStr) {
+    const suffix = Number(endStr);
+    if (!Number.isInteger(suffix) || suffix <= 0) return "invalid";
+    start = Math.max(0, totalLength - suffix);
+    end = totalLength - 1;
+  } else {
+    start = Number(startStr);
+    if (!Number.isInteger(start) || start < 0) return "invalid";
+    if (!endStr) {
+      end = totalLength - 1;
+    } else {
+      end = Number(endStr);
+      if (!Number.isInteger(end) || end < 0) return "invalid";
+      end = Math.min(end, totalLength - 1);
+    }
+  }
+
+  if (start > end || start >= totalLength) return "invalid";
+  return { start, end };
+}
 
 export interface HttpResponseSink {
   writeHead: (status: number, headers: Record<string, string>) => void;
@@ -124,7 +187,11 @@ export class AcrowlyHttpServer {
   private async handleNodeHttp(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const chunks: Buffer[] = [];
     let total = 0;
-    const isUpload = (req.url ?? "").startsWith("/api/files");
+    const rawUrl = req.url ?? "";
+    const reqContentType = String(req.headers["content-type"] ?? "").toLowerCase();
+    const isUpload =
+      rawUrl.startsWith("/api/files") ||
+      (rawUrl.startsWith("/api/chat/messages") && reqContentType.includes("multipart/form-data"));
     const maxBytes = isUpload ? MAX_UPLOAD_BYTES : MAX_JSON_BYTES;
 
     req.on("data", (chunk: Buffer) => {
@@ -372,27 +439,72 @@ export class AcrowlyHttpServer {
       }
 
       if (pathname === "/api/chat/messages" && method === "POST") {
-        let body: { text?: string; clientMsgId?: string };
-        try {
-          body = JSON.parse(req.body.toString("utf8") || "{}") as {
-            text?: string;
-            clientMsgId?: string;
-          };
-        } catch {
-          this.sendJson(sink, 400, { error: "Invalid JSON body" }, req.headers);
-          return;
+        const ctRaw = req.headers["content-type"];
+        const contentType = (Array.isArray(ctRaw) ? ctRaw[0] : ctRaw) ?? "";
+
+        let rawText = "";
+        let clientMsgId: string | undefined;
+        const savedAttachments: UploadedFileResponse[] = [];
+
+        if (contentType.toLowerCase().includes("multipart/form-data")) {
+          const parsed = parseMultipartFormData(req.body, contentType);
+          if (!parsed) {
+            this.sendJson(sink, 400, { error: "Invalid multipart/form-data body" }, req.headers);
+            return;
+          }
+          rawText = (parsed.fields.text ?? "").trim();
+          const rawClientMsgId = (parsed.fields.clientMsgId ?? "").trim();
+          if (rawClientMsgId) clientMsgId = rawClientMsgId;
+
+          if (!rawText && parsed.files.length === 0) {
+            this.sendJson(
+              sink,
+              400,
+              { error: "Message text or uploaded files must not be empty" },
+              req.headers
+            );
+            return;
+          }
+
+          for (const file of parsed.files) {
+            const saved = await this.deps.attachmentStore.saveUpload({
+              filename: file.filename,
+              declaredMime: file.mime,
+              data: file.data,
+            });
+            savedAttachments.push(toUploadedFileResponse(saved));
+          }
+        } else {
+          let body: { text?: string; clientMsgId?: string };
+          try {
+            body = JSON.parse(req.body.toString("utf8") || "{}") as {
+              text?: string;
+              clientMsgId?: string;
+            };
+          } catch {
+            this.sendJson(sink, 400, { error: "Invalid JSON body" }, req.headers);
+            return;
+          }
+
+          rawText = typeof body.text === "string" ? body.text.trim() : "";
+          clientMsgId = typeof body.clientMsgId === "string" ? body.clientMsgId : undefined;
+          if (!rawText) {
+            this.sendJson(sink, 400, { error: "Message text must not be empty" }, req.headers);
+            return;
+          }
         }
 
-        const text = typeof body.text === "string" ? body.text.trim() : "";
-        if (!text) {
-          this.sendJson(sink, 400, { error: "Message text must not be empty" }, req.headers);
-          return;
+        const textParts: string[] = [];
+        if (rawText) textParts.push(rawText);
+        if (savedAttachments.length > 0) {
+          textParts.push(savedAttachments.map((a) => a.markdown).join("\n"));
         }
+        const combinedText = textParts.join("\n");
 
         const { message, duplicate } = await this.deps.chatStore.appendMessage({
           role: "user",
-          text,
-          clientMsgId: typeof body.clientMsgId === "string" ? body.clientMsgId : undefined,
+          text: combinedText,
+          clientMsgId,
         });
 
         if (!duplicate) {
@@ -411,6 +523,7 @@ export class AcrowlyHttpServer {
               createdAt: message.createdAt,
             },
             duplicate,
+            ...(savedAttachments.length > 0 ? { attachments: savedAttachments } : {}),
           },
           req.headers
         );
@@ -483,54 +596,49 @@ export class AcrowlyHttpServer {
         const ctRaw = req.headers["content-type"];
         const contentType = (Array.isArray(ctRaw) ? ctRaw[0] : ctRaw) ?? "";
 
-        let filename = "upload.bin";
-        let declaredMime = contentType;
-        let data = req.body;
-
         if (contentType.toLowerCase().includes("multipart/form-data")) {
-          const parsed = parseMultipartSingleFile(req.body, contentType);
-          if (!parsed) {
+          const parsed = parseMultipartFormData(req.body, contentType);
+          if (!parsed || parsed.files.length === 0) {
             this.sendJson(sink, 400, { error: "Missing multipart file field" }, req.headers);
             return;
           }
-          filename = parsed.filename;
-          declaredMime = parsed.mime;
-          data = parsed.data;
-        } else {
-          const xNameRaw = req.headers["x-filename"];
-          const xName = Array.isArray(xNameRaw) ? xNameRaw[0] : xNameRaw;
-          if (xName) {
-            filename = decodeURIComponent(xName);
-          }
-        }
 
-        try {
-          const saved = await this.deps.attachmentStore.saveUpload({
-            filename,
-            declaredMime,
-            data,
-          });
+          const uploaded: UploadedFileResponse[] = [];
+          for (const file of parsed.files) {
+            const saved = await this.deps.attachmentStore.saveUpload({
+              filename: file.filename,
+              declaredMime: file.mime,
+              data: file.data,
+            });
+            uploaded.push(toUploadedFileResponse(saved));
+          }
+
           this.sendJson(
             sink,
             201,
-            {
-              id: saved.id,
-              kind: saved.kind,
-              name: saved.name,
-              mime: saved.mime,
-              size: saved.size,
-              url: saved.url,
-              markdown: saved.markdown,
-            },
+            uploaded.length === 1 ? uploaded[0] : { ...uploaded[0], files: uploaded },
             req.headers
           );
-        } catch (err) {
-          if (err instanceof VideoRejectedError) {
-            this.sendJson(sink, 415, { error: err.message }, req.headers);
-            return;
-          }
-          throw err;
+          return;
         }
+
+        let filename = "upload.bin";
+        const xNameRaw = req.headers["x-filename"];
+        const xName = Array.isArray(xNameRaw) ? xNameRaw[0] : xNameRaw;
+        if (xName) {
+          try {
+            filename = decodeURIComponent(xName);
+          } catch {
+            filename = xName;
+          }
+        }
+
+        const saved = await this.deps.attachmentStore.saveUpload({
+          filename,
+          declaredMime: contentType,
+          data: req.body,
+        });
+        this.sendJson(sink, 201, toUploadedFileResponse(saved), req.headers);
         return;
       }
 
@@ -549,16 +657,50 @@ export class AcrowlyHttpServer {
         }
 
         const forceDownload = parsedUrl.searchParams.get("download") === "1";
-        const disposition =
-          forceDownload || loaded.meta.kind !== "image" ? "attachment" : "inline";
+        const isInlineMedia =
+          loaded.meta.kind === "image" ||
+          loaded.meta.mime.startsWith("video/") ||
+          loaded.meta.mime.startsWith("audio/");
+        const disposition = forceDownload || !isInlineMedia ? "attachment" : "inline";
         const encoded = encodeURIComponent(loaded.meta.name);
+        const totalLength = loaded.data.length;
 
-        sink.writeHead(200, {
+        const baseHeaders: Record<string, string> = {
           ...this.corsHeaders(req.headers),
           "Content-Type": loaded.meta.mime,
-          "Content-Length": String(loaded.data.length),
+          "Accept-Ranges": "bytes",
           "Content-Disposition": `${disposition}; filename*=UTF-8''${encoded}`,
           "Cache-Control": "private, max-age=86400",
+        };
+
+        const rangeRaw = req.headers.range;
+        const rangeHeader = Array.isArray(rangeRaw) ? rangeRaw[0] : rangeRaw;
+        if (rangeHeader) {
+          const parsedRange = parseByteRange(rangeHeader, totalLength);
+          if (parsedRange === "invalid") {
+            sink.writeHead(416, {
+              ...baseHeaders,
+              "Content-Range": `bytes */${totalLength}`,
+              "Content-Length": "0",
+            });
+            sink.end();
+            return;
+          }
+          if (parsedRange) {
+            const slice = loaded.data.subarray(parsedRange.start, parsedRange.end + 1);
+            sink.writeHead(206, {
+              ...baseHeaders,
+              "Content-Range": `bytes ${parsedRange.start}-${parsedRange.end}/${totalLength}`,
+              "Content-Length": String(slice.length),
+            });
+            sink.end(slice);
+            return;
+          }
+        }
+
+        sink.writeHead(200, {
+          ...baseHeaders,
+          "Content-Length": String(totalLength),
         });
         sink.end(loaded.data);
         return;

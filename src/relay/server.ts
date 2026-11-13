@@ -23,7 +23,7 @@ const RELAY_LANDING_HTML = `<!doctype html>
 </head>
 <body>
   <h3>Acrowly 无状态中继站</h3>
-  <p>此服务仅用于给无公网 IP 的本地 Acrowly 主机提供纯文本聊天通道透传，不保存密钥、消息或文件。</p>
+  <p>此服务仅用于给无公网 IP 的本地 Acrowly 主机提供聊天与文件通道透传，不保存密钥、消息或文件。</p>
   <p>访问你的设备请使用 <code>/d/&lt;deviceId&gt;/</code> 或子域名 <code>&lt;deviceId&gt;.acrowly.com</code>。</p>
 </body>
 </html>`;

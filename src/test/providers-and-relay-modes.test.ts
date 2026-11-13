@@ -158,7 +158,7 @@ test("LlmClient formats Gemini (with thoughtSignature) and Anthropic (with ephem
   });
 });
 
-test("Relay supports X-Acrowly-Device header routing and binary file uploads + video rejection over tunnel", async () => {
+test("Relay supports X-Acrowly-Device header routing, binary /api/files uploads, and multipart /api/chat/messages over tunnel", async () => {
   await withTempDir(async (dir) => {
     const relay = new AcrowlyRelayServer({ host: "127.0.0.1", port: 0, baseDomain: "acrowly.com" });
     const relayAddr = await relay.start();
@@ -234,7 +234,7 @@ test("Relay supports X-Acrowly-Device header routing and binary file uploads + v
       assert.equal(downRes.status, 200);
       assert.deepEqual(Buffer.from(await downRes.arrayBuffer()), pngBytes);
 
-      // Video upload over tunnel rejected with 415
+      // Arbitrary file (including video) upload over tunnel succeeds with 201
       const vidRes = await fetch(`${relayBase}/api/files`, {
         method: "POST",
         headers: {
@@ -243,9 +243,52 @@ test("Relay supports X-Acrowly-Device header routing and binary file uploads + v
           "X-Filename": "movie.mp4",
           "Content-Type": "video/mp4",
         },
-        body: Buffer.from("fake-video"),
+        body: Buffer.from("fake-video-bytes"),
       });
-      assert.equal(vidRes.status, 415);
+      assert.equal(vidRes.status, 201);
+      const vidJson = (await vidRes.json()) as { kind: string; mime: string; url: string };
+      assert.equal(vidJson.kind, "file");
+      assert.equal(vidJson.mime, "video/mp4");
+
+      const vidRangeRes = await fetch(`${relayBase}${vidJson.url}`, {
+        headers: {
+          "X-Acrowly-Device": "iphone-node",
+          Authorization: `Bearer ${sessionToken}`,
+          Range: "bytes=0-3",
+        },
+      });
+      assert.equal(vidRangeRes.status, 206);
+      assert.equal(await vidRangeRes.text(), "fake");
+
+      // Multipart POST /api/chat/messages with text + file over tunnel
+      const boundary = "----relayMultipartBoundary";
+      const mpBody = Buffer.concat([
+        Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="text"\r\n\r\n看下这个附件\r\n` +
+            `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="report.pdf"\r\nContent-Type: application/pdf\r\n\r\n` +
+            `%PDF-1.4-mock` +
+            `\r\n--${boundary}--\r\n`
+        ),
+      ]);
+      const mpChatRes = await fetch(`${relayBase}/api/chat/messages`, {
+        method: "POST",
+        headers: {
+          "X-Acrowly-Device": "iphone-node",
+          Authorization: `Bearer ${sessionToken}`,
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        },
+        body: mpBody,
+      });
+      assert.equal(mpChatRes.status, 202);
+      const mpChatJson = (await mpChatRes.json()) as {
+        message: { text: string };
+        attachments: Array<{ name: string; mime: string; url: string }>;
+      };
+      assert.equal(mpChatJson.attachments.length, 1);
+      assert.equal(mpChatJson.attachments[0].name, "report.pdf");
+      assert.equal(mpChatJson.attachments[0].mime, "application/pdf");
+      assert.match(mpChatJson.message.text, /看下这个附件/);
+      assert.match(mpChatJson.message.text, /\[report\.pdf\]\(\/api\/files\//);
     } finally {
       await daemon.stop();
       await relay.stop();

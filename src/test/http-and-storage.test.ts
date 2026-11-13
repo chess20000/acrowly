@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -12,7 +13,7 @@ import {
   parseEd25519PublicKey,
   signWithEd25519PrivateKey,
 } from "../server/ed25519.js";
-import { AttachmentStore, VideoRejectedError } from "../storage/attachment-store.js";
+import { AttachmentStore } from "../storage/attachment-store.js";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "acrowly-test-"));
@@ -23,7 +24,7 @@ async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   }
 }
 
-test("AttachmentStore rejects videos by MIME, extension, and magic bytes while allowing images & TS files", async () => {
+test("AttachmentStore accepts arbitrary file types (images, TypeScript source, PDFs, videos, MPEG-TS)", async () => {
   await withTempDir(async (dir) => {
     const store = new AttachmentStore(path.join(dir, "files"));
     await store.init();
@@ -47,59 +48,53 @@ test("AttachmentStore rejects videos by MIME, extension, and magic bytes while a
     });
     assert.equal(savedHeic.kind, "image");
 
-    // Valid TypeScript source file (.ts text)
+    // TypeScript source file (.ts text) vs binary MPEG-TS stream (.ts binary)
     const savedTs = await store.saveUpload({
       filename: "helper.ts",
-      declaredMime: "text/plain",
+      declaredMime: "application/octet-stream",
       data: Buffer.from("export const x = 1;\n", "utf8"),
     });
     assert.equal(savedTs.kind, "file");
+    assert.equal(savedTs.mime, "text/plain; charset=utf-8");
 
-    // Reject video MIME
-    await assert.rejects(
-      () =>
-        store.saveUpload({
-          filename: "clip.bin",
-          declaredMime: "video/mp4",
-          data: Buffer.from("dummy"),
-        }),
-      VideoRejectedError
-    );
+    const tsBinary = Buffer.alloc(400, 0);
+    tsBinary[0] = 0x47;
+    tsBinary[188] = 0x47;
+    tsBinary[376] = 0x47;
+    const savedMpegTs = await store.saveUpload({
+      filename: "stream.ts",
+      declaredMime: "application/octet-stream",
+      data: tsBinary,
+    });
+    assert.equal(savedMpegTs.kind, "file");
+    assert.equal(savedMpegTs.mime, "video/mp2t");
 
-    // Reject .mov extension
-    await assert.rejects(
-      () =>
-        store.saveUpload({
-          filename: "clip.mov",
-          declaredMime: "application/octet-stream",
-          data: Buffer.from("dummy"),
-        }),
-      VideoRejectedError
-    );
+    // Video MIME & container extensions now accepted cleanly
+    const savedMp4 = await store.saveUpload({
+      filename: "clip.mp4",
+      declaredMime: "video/mp4",
+      data: Buffer.from("fake-mp4-data"),
+    });
+    assert.equal(savedMp4.kind, "file");
+    assert.equal(savedMp4.mime, "video/mp4");
+    assert.match(savedMp4.markdown, /^\[clip\.mp4\]\(\/api\/files\//);
 
-    // Reject disguised MP4 ftypmp42 magic bytes
-    const mp4Magic = Buffer.from("\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00", "latin1");
-    await assert.rejects(
-      () =>
-        store.saveUpload({
-          filename: "disguised.bin",
-          declaredMime: "application/octet-stream",
-          data: mp4Magic,
-        }),
-      VideoRejectedError
-    );
+    const savedMov = await store.saveUpload({
+      filename: "clip.mov",
+      declaredMime: "application/octet-stream",
+      data: Buffer.from("fake-mov-data"),
+    });
+    assert.equal(savedMov.kind, "file");
+    assert.equal(savedMov.mime, "video/quicktime");
 
-    // Reject disguised AVI magic bytes
-    const aviMagic = Buffer.from("RIFF\x00\x00\x00\x00AVI ", "latin1");
-    await assert.rejects(
-      () =>
-        store.saveUpload({
-          filename: "disguised.dat",
-          declaredMime: "application/octet-stream",
-          data: aviMagic,
-        }),
-      VideoRejectedError
-    );
+    // Unknown extension binary fallback also saves cleanly without error
+    const binSaved = await store.saveUpload({
+      filename: "archive.bin",
+      declaredMime: "application/octet-stream",
+      data: Buffer.from([0x00, 0x01, 0x02, 0x03]),
+    });
+    assert.equal(binSaved.kind, "file");
+    assert.equal(binSaved.mime, "application/octet-stream");
   });
 });
 
@@ -136,7 +131,7 @@ test("Pure Chat HTTP API, SSE sync, file upload/download, auth, secret redaction
       assert.equal(liveUiRes.status, 200);
       assert.equal(await liveUiRes.text(), webuiHtml);
 
-      // 3. Upload image via multipart/form-data & reject video upload with 415
+      // 3. Upload arbitrary files via /api/files (images, videos, Range 206/416) and multipart /api/chat/messages
       const boundary = "----acrowlyBoundary123";
       const imgBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
       const multipartBody = Buffer.concat([
@@ -166,9 +161,64 @@ test("Pure Chat HTTP API, SSE sync, file upload/download, auth, secret redaction
           "Content-Type": "video/mp4",
           "X-Filename": "demo.mp4",
         },
-        body: Buffer.from("fake-mp4"),
+        body: Buffer.from("0123456789"),
       });
-      assert.equal(videoUploadRes.status, 415);
+      assert.equal(videoUploadRes.status, 201);
+      const videoUploaded = (await videoUploadRes.json()) as { url: string; mime: string; kind: string };
+      assert.equal(videoUploaded.kind, "file");
+      assert.equal(videoUploaded.mime, "video/mp4");
+
+      const range206Res = await fetch(`${base}${videoUploaded.url}`, {
+        headers: { Range: "bytes=2-5" },
+      });
+      assert.equal(range206Res.status, 206);
+      assert.equal(range206Res.headers.get("content-range"), "bytes 2-5/10");
+      assert.match(range206Res.headers.get("content-disposition") ?? "", /^inline;/);
+      assert.equal(await range206Res.text(), "2345");
+
+      const range416Res = await fetch(`${base}${videoUploaded.url}`, {
+        headers: { Range: "bytes=99-120" },
+      });
+      assert.equal(range416Res.status, 416);
+      assert.equal(range416Res.headers.get("content-range"), "bytes */10");
+
+      // Direct multipart /api/chat/messages with multiple files (video + RFC 5987 UTF-8 filename) and no text
+      const chatBoundary = "----acrowlyChatMpBoundary";
+      const chatMultipartBody = Buffer.concat([
+        Buffer.from(
+          `--${chatBoundary}\r\nContent-Disposition: form-data; name="files"; filename="clip.webm"\r\nContent-Type: video/webm\r\n\r\n` +
+            `webm-payload` +
+            `\r\n--${chatBoundary}\r\nContent-Disposition: form-data; name="files"; filename*=UTF-8''%E8%B5%84%E6%96%99.txt\r\nContent-Type: text/plain\r\n\r\n` +
+            `hello file` +
+            `\r\n--${chatBoundary}--\r\n`
+        ),
+      ]);
+      const mpPostRes = await fetch(`${base}/api/chat/messages`, {
+        method: "POST",
+        headers: { "Content-Type": `multipart/form-data; boundary=${chatBoundary}` },
+        body: chatMultipartBody,
+      });
+      assert.equal(mpPostRes.status, 202);
+      const mpPostJson = (await mpPostRes.json()) as {
+        message: { text: string };
+        attachments: Array<{ name: string; url: string; mime: string }>;
+      };
+      assert.equal(mpPostJson.attachments.length, 2);
+      assert.equal(mpPostJson.attachments[0].name, "clip.webm");
+      assert.equal(mpPostJson.attachments[1].name, "资料.txt");
+      assert.match(mpPostJson.message.text, /\[clip\.webm\]\(\/api\/files\//);
+      assert.match(mpPostJson.message.text, /\[资料\.txt\]\(\/api\/files\//);
+
+      // Empty multipart /api/chat/messages rejected with 400
+      const emptyMpBody = Buffer.from(
+        `--${chatBoundary}\r\nContent-Disposition: form-data; name="text"\r\n\r\n   \r\n--${chatBoundary}--\r\n`
+      );
+      const emptyMpRes = await fetch(`${base}/api/chat/messages`, {
+        method: "POST",
+        headers: { "Content-Type": `multipart/form-data; boundary=${chatBoundary}` },
+        body: emptyMpBody,
+      });
+      assert.equal(emptyMpRes.status, 400);
 
       // 4. Idempotent message send + SSE stream verification
       // Stop coordinator loop from calling external OpenAI by only testing ChatStore/HTTP via direct append + POST check
@@ -389,4 +439,84 @@ test("SnapshotManager backs up and restores webui and extensions cleanly", async
 
 test("getDefaultModelForProvider returns deepseek-flash for deepseek", () => {
   assert.equal(getDefaultModelForProvider("deepseek"), "deepseek-flash");
+});
+
+test("Coordinator hydrates uploaded images and non-image attachment localPath metadata from multipart /api/chat/messages", async () => {
+  await withTempDir(async (dir) => {
+    const capturedMessages: Array<Array<{ role: string; content: unknown }>> = [];
+    const mockLlm = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+          messages: Array<{ role: string; content: unknown }>;
+        };
+        capturedMessages.push(body.messages);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message: { content: "已收到图片和视频附件路径" } }] }));
+      });
+    });
+
+    await new Promise<void>((resolve) => mockLlm.listen(0, "127.0.0.1", resolve));
+    const llmPort = (mockLlm.address() as { port: number }).port;
+
+    const prevPort = process.env.PORT;
+    process.env.PORT = "0";
+    const daemon = await createAcrowlyDaemon(dir);
+
+    try {
+      await daemon.configStore.setBootstrapModel({
+        provider: "openai",
+        apiKey: "sk-dummy-coord",
+        model: "gpt-4.1",
+        baseUrl: `http://127.0.0.1:${llmPort}/v1`,
+      });
+      const addr = await daemon.start();
+      const base = `http://${addr.host}:${addr.port}`;
+
+      const boundary = "----coordHydrationBoundary";
+      const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+      const body = Buffer.concat([
+        Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="text"\r\n\r\n看下这些文件\r\n` +
+            `--${boundary}\r\nContent-Disposition: form-data; name="files"; filename="photo.png"\r\nContent-Type: image/png\r\n\r\n`
+        ),
+        pngBytes,
+        Buffer.from(
+          `\r\n--${boundary}\r\nContent-Disposition: form-data; name="files"; filename="sample.mp4"\r\nContent-Type: video/mp4\r\n\r\n` +
+            `mp4-bytes` +
+            `\r\n--${boundary}--\r\n`
+        ),
+      ]);
+
+      const postRes = await fetch(`${base}/api/chat/messages`, {
+        method: "POST",
+        headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+        body,
+      });
+      assert.equal(postRes.status, 202);
+
+      const deadline = Date.now() + 5000;
+      while (capturedMessages.length === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      assert.equal(capturedMessages.length, 1);
+
+      const userMsg = capturedMessages[0].find((m) => m.role === "user");
+      assert.ok(userMsg && Array.isArray(userMsg.content));
+      const parts = userMsg.content as Array<{ type: string; text?: string; image_url?: { url: string } }>;
+      const textPart = parts.find((p) => p.type === "text")?.text ?? "";
+      const imagePart = parts.find((p) => p.type === "image_url")?.image_url?.url ?? "";
+
+      assert.match(textPart, /\[附件元信息\]/);
+      assert.match(textPart, /photo\.png \| kind=image \| mime=image\/png \| size=12 bytes \| localPath=/);
+      assert.match(textPart, /sample\.mp4 \| kind=file \| mime=video\/mp4 \| size=9 bytes \| localPath=/);
+      assert.match(imagePart, /^data:image\/png;base64,/);
+    } finally {
+      await daemon.stop();
+      await new Promise<void>((resolve) => mockLlm.close(() => resolve()));
+      if (prevPort === undefined) delete process.env.PORT;
+      else process.env.PORT = prevPort;
+    }
+  });
 });

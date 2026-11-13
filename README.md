@@ -6,7 +6,7 @@
 
 - **极简使用流程**：一键安装启动 → 首次仅输入「模型提供商 + API Key」→ 自动生成并授权本机 Ed25519 密钥对 → 进入原生纯文本终端与**好为人师的主协调器**对话 → 添加其它设备 Ed25519 公钥、`acrowly.com` 无公网 IP 穿透、新增模型与实时扩展、甚至专属本地 WebUI 全部在聊天里完成。
 - **SSH 级纯密钥鉴权（无密码、无静态 Token）**：所有支持 `acl` API 的客户端自带 Ed25519 Keygen，私钥永不出设备，将公钥加入主机即可通过挑战签名登录。
-- **纯文本聊天 API**：协议仅传输对话文本（`seq` 单调递增、`POST /api/chat/messages` + `GET /api/chat/stream`），图片与文件通过独立 `/api/files` 转成 Markdown 链接内嵌，**接口层严格拒收视频**。
+- **极简聊天与全文件传输 API**：消息流通过统一连续时间线传输（`seq` 单调递增、`POST /api/chat/messages` + `GET /api/chat/stream`），支持通过 `POST /api/chat/messages`（`multipart/form-data` 一并发送文本与多个文件）或独立 `POST /api/files` + `GET /api/files/:id/:filename`（支持断点续传 `Range`）传输任意格式文件（图片、文档、代码、压缩包、音频、视频等）。
 - **协调器 + 朴素子代理 + 200K/闲时上下文压缩**：主协调器尽量少亲自动手，将代码/网页/扩展编写与长任务全部派发给独立子代理；前缀保持不可变以最大化 Prompt Cache 命中，默认每 200K tokens 或闲置 30 分钟自动压缩一次。
 - **无公网 IP 穿透中继（`acrowly.com`）**：本地 Daemon 主动发起出站 WebSocket 长连接至 `acrowly.com`，网页与 iOS App 无需用户懂内网穿透即可随时随地访问。
 

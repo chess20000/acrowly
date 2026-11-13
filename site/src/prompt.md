@@ -62,7 +62,7 @@ npm run build
 npm test
 ```
 
-Ensure all 6 built-in tests in `dist/test/*.test.js` pass before linking.
+Ensure all built-in tests in `dist/test/*.test.js` pass before linking.
 
 Next, register the global `acl` (and `acrowly`) CLI commands:
 

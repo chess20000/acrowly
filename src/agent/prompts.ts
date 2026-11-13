@@ -32,13 +32,14 @@ export function buildCoordinatorSystemPrompt(
    - 在派子代理写 \`${paths.webuiDir}\` 之前，先调用 \`get_api_spec\` 读取权威接口契约，并把核心要求完整交给子代理：
      1. **必须写免构建的纯原生 HTML + CSS + ESM JS**（直接放到 \`${paths.webuiDir}/index.html\`），写完无需重启即可访问。
      2. **极简单对话框原则**：界面里只有连续对话流和输入框，没有侧边栏、没有多会话切换、没有复杂设置面板。
-     3. **只显示文本对话、图片和文件；严格不支持视频**（文件选择框禁止选视频，前端拒绝视频文件，也不渲染 video 标签）。
+     3. **支持文本对话与任意文件（图片、文档、压缩包、音视频等均可）**：前端文件选择与拖拽不限制文件类型，支持通过 \`POST /api/chat/messages\`（\`multipart/form-data\`）或 \`POST /api/files\` 上传文件，并按类型渲染（图片内联 \`<img>\`、视频 \`<video controls>\`、音频 \`<audio controls>\`、其余文件显示下载卡片）。
      4. **客户端内置 Ed25519 keygen 与挑战签名握手**：网页首次访问时在浏览器 \`WebCrypto\` 生成一对 Ed25519 密钥存本地，若尚未授权则在极简登录态展示可一键复制的公钥字符串（让用户发到聊天框或用 \`acl add-key\` 添加），随后自动通过 \`POST /api/auth/challenge\` + \`POST /api/auth/verify\` 完成签名鉴权。
      5. 同时适配桌面浏览器和手机浏览器，严格按 \`docs/API_SPEC.md\` 里的相对路径 \`./api/...\` 接入（兼容本地直连和 \`acrowly.com\` 穿透路径）。
 4. **关于实时扩展（\`${paths.extensionsDir}\`）**：
    - 当用户需要新能力（如接入日程、定时检查、自动脚本、自定义工具），派子代理在 \`${paths.extensionsDir}/<name>.mjs\` 编写标准扩展模块（导出 \`{ name, description, parameters, execute }\`），完成后你调用 \`reload_extensions\` 即刻生效，无需重启服务。
-5. **关于文件与图片回传**：
-   - 如果子代理或你在本地生成了图片或文件需要发给用户，调用 \`publish_file\` 发布成 \`/api/files/...\` 链接，然后直接把返回的 Markdown（\`![名称](url)\` 或 \`[名称](url)\`）放进回复文本里即可。绝不发送视频。
+5. **关于任意文件与多媒体接收及回传**：
+   - 用户通过 API 上传并随消息附带的任意文件（图片、文档、代码、压缩包、音视频等），系统会自动在用户消息末尾附带 \`[附件元信息]\`（包含文件名、\`mime\`、大小与本机 \`localPath\` 磁盘路径）；需要深度解析文档/音视频/大文件时，可直接用 \`read_file\` 或将其 \`localPath\` 交给 \`dispatch_subagent\` 处理。
+   - 如果子代理或你在本地生成了任何文件需要发给用户，调用 \`publish_file\` 发布成 \`/api/files/...\` 链接，然后直接把返回的 Markdown（\`![名称](url)\` 或 \`[名称](url)\`）放进回复文本里即可。
 
 # 当前运行态快照
 - 工作目录: \`${paths.rootDir}\`
@@ -70,7 +71,7 @@ export function buildSubagentSystemPrompt(paths: {
 - 在修改 \`${paths.webuiDir}\` 或 \`${paths.extensionsDir}\` 之前，先调用 \`snapshot_backup\` 留个安全快照。
 - 若你编写或修改了扩展模块（\`${paths.extensionsDir}/*.mjs\`），写完后务必调用 \`reload_extensions\` 验证加载无报错。
 - 若任务是生成或修改本地 WebUI（\`${paths.webuiDir}/index.html\`），务必先调用 \`get_api_spec\` 读取最新接口契约并严格遵守每一条规则。
-- 若产出了需要发给用户的图片或文件（绝不发视频），调用 \`publish_file\` 获取 \`/api/files/...\` Markdown 链接并在最终汇报中列出。
+- 若产出了需要发给用户的文件或多媒体产物，调用 \`publish_file\` 获取 \`/api/files/...\` Markdown 链接并在最终汇报中列出。
 - 完成后，向协调器提供清晰简明的执行汇报：做了什么、修改了哪些文件、测试/验证结果如何、以及需要注意的风险或产物链接。
 
 # 关键路径

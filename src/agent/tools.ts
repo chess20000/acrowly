@@ -92,7 +92,7 @@ const SUBAGENT_TOOL_DEFS: ToolDefinition[] = [
   {
     name: "publish_file",
     description:
-      "Publish a local image or file (never video) to /api/files/... and return its URL and Markdown snippet for chat.",
+      "Publish any local file (image, document, archive, audio, video, binary, etc.) to /api/files/... and return its URL and Markdown snippet for chat.",
     parameters: {
       type: "object",
       properties: {
@@ -317,7 +317,8 @@ const COORDINATOR_BASE_TOOL_DEFS: ToolDefinition[] = [
   },
   {
     name: "publish_file",
-    description: "Publish a local image or file (not video) to /api/files/... for sending in chat.",
+    description:
+      "Publish any local file (image, document, archive, audio, video, binary, etc.) to /api/files/... for sending in chat.",
     parameters: {
       type: "object",
       properties: {
@@ -475,15 +476,15 @@ async function executeHostTool(
       try {
         return await fs.readFile(specPath, "utf8");
       } catch {
-        return `Pure Chat API Endpoints:
+        return `Acrowly Chat & File API Endpoints:
 - GET /api/auth/status
 - POST /api/auth/challenge ({ fingerprint? | publicKey? }) -> { challengeId, nonce, message, expiresAt }
 - POST /api/auth/verify ({ challengeId, signature }) -> { ok, token, keyId, label, fingerprint }
 - GET /api/chat/messages?after_seq=&before_seq=&limit=
-- POST /api/chat/messages ({ text, clientMsgId? }) -> 202 { message }
+- POST /api/chat/messages (JSON { text, clientMsgId? } OR multipart/form-data fields text, clientMsgId + file/files parts of any type) -> 202 { message, duplicate, attachments? }
 - GET /api/chat/stream?after_seq= (SSE event: message, data: ChatMessage JSON)
-- POST /api/files (multipart 'file' or raw + X-Filename; NO VIDEO) -> { id, kind, url, markdown }
-- GET /api/files/:id/:filename`;
+- POST /api/files (multipart/form-data single/multiple files or raw + X-Filename; any file type allowed) -> { id, kind, name, mime, size, url, markdown, files? }
+- GET /api/files/:id/:filename (supports HTTP Range 206 & ?download=1)`;
       }
     }
 
