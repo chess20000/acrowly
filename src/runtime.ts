@@ -142,7 +142,7 @@ export async function createAcrowlyDaemon(
       return addr;
     },
     stop: async () => {
-      stopTrackedShells();
+      await stopTrackedShells();
       await coordinator.stop();
       tunnelClient.stop();
       await httpServer.stop();

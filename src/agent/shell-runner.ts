@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,37 +20,84 @@ const BACKGROUND_TIMEOUT_DEFAULT_MS = 30 * 60_000;
 interface LiveJob {
   pid: number;
   timer: NodeJS.Timeout;
+  child: ChildProcess;
 }
 
 const liveJobs = new Set<LiveJob>();
+const liveChildren = new Set<ChildProcess>();
 
-export function stopTrackedShells(): void {
-  for (const job of liveJobs) {
-    clearTimeout(job.timer);
-    if (job.pid > 0 && process.platform === "win32") {
-      const killer = spawn("taskkill", ["/PID", String(job.pid), "/T", "/F"], {
+function taskkillExe(): string {
+  const root = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  return path.join(root, "System32", "taskkill.exe");
+}
+
+function closeChildStreams(child: ChildProcess): void {
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+  child.stdin?.destroy();
+}
+
+function trackChild(child: ChildProcess): void {
+  liveChildren.add(child);
+  const release = (): void => {
+    liveChildren.delete(child);
+    closeChildStreams(child);
+  };
+  child.once("exit", release);
+  child.once("error", release);
+}
+
+function waitForExit(child: ChildProcess, timeoutMs = 8000): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+/** Kill pid and every process it started. taskkill /T is synchronous and waits. */
+export function killProcessTreeSync(pid: number | undefined): void {
+  if (!pid || pid <= 0) return;
+  if (process.platform === "win32") {
+    try {
+      execFileSync(taskkillExe(), ["/PID", String(pid), "/T", "/F"], {
         windowsHide: true,
         stdio: "ignore",
+        timeout: 8000,
       });
-      killer.on("error", () => {
-        try {
-          process.kill(job.pid);
-        } catch {
-          // already gone
-        }
-      });
-      continue;
-    }
-    try {
-      process.kill(-job.pid, "SIGTERM");
     } catch {
       try {
-        process.kill(job.pid, "SIGTERM");
+        process.kill(pid);
       } catch {
         // already gone
       }
     }
+    return;
   }
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+  }
+}
+
+export async function stopTrackedShells(): Promise<void> {
+  for (const job of liveJobs) clearTimeout(job.timer);
+  const pending = [...liveChildren];
+  for (const child of pending) {
+    if (child.exitCode === null && child.signalCode === null) {
+      killProcessTreeSync(child.pid);
+    }
+  }
+  await Promise.all(pending.map((child) => waitForExit(child)));
+  for (const child of pending) closeChildStreams(child);
   liveJobs.clear();
 }
 
@@ -157,31 +204,7 @@ export function splitBackgroundCommand(command: string): { background: boolean; 
 }
 
 function killGroup(child: ChildProcess): void {
-  if (!child.pid) return;
-  if (process.platform === "win32") {
-    // Kill the PowerShell process and anything it started (node, curl, sleep).
-    const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-      windowsHide: true,
-      stdio: "ignore",
-    });
-    killer.on("error", () => {
-      try {
-        child.kill();
-      } catch {
-        // already gone
-      }
-    });
-    return;
-  }
-  try {
-    process.kill(-child.pid, "SIGTERM");
-  } catch {
-    try {
-      child.kill("SIGTERM");
-    } catch {
-      // already gone
-    }
-  }
+  killProcessTreeSync(child.pid);
 }
 
 function formatStreams(stdout: string, stderr: string, exitCode: number, timedOut: boolean): string {
@@ -258,15 +281,23 @@ function startBackground(options: {
     windowsHide: true,
   });
   if (child.pid && options.actor) registerShellPid(child.pid, options.actor);
+  trackChild(child);
 
   let settled = false;
-  const job: LiveJob = { pid: child.pid ?? -1, timer: undefined as unknown as NodeJS.Timeout };
+  let killedByTimeout = false;
+  const job: LiveJob = {
+    pid: child.pid ?? -1,
+    timer: undefined as unknown as NodeJS.Timeout,
+    child,
+  };
+  const timeoutText = formatUserVisibleReply(`后台 ${label} 到时限结束，没有完成，也没有外部回执。`);
   const finish = (text: string): void => {
     if (settled) return;
     settled = true;
     clearTimeout(job.timer);
     liveJobs.delete(job);
     if (child.pid) unregisterShellPid(child.pid);
+    closeChildStreams(child);
     if (options.actor) releaseActor(options.actor);
     if (options.onSettled) {
       void options.onSettled(text).catch(() => {});
@@ -274,8 +305,9 @@ function startBackground(options: {
   };
 
   job.timer = setTimeout(() => {
+    killedByTimeout = true;
     killGroup(child);
-    finish(formatUserVisibleReply(`后台 ${label} 到时限结束，没有完成，也没有外部回执。`));
+    finish(timeoutText);
   }, options.timeoutMs);
   if (child.pid) liveJobs.add(job);
 
@@ -284,8 +316,8 @@ function startBackground(options: {
   });
   child.on("exit", (code, signal) => {
     if (settled) return;
-    if (signal) {
-      finish(formatUserVisibleReply(`后台 ${label} 到时限结束，没有完成，也没有外部回执。`));
+    if (killedByTimeout || signal) {
+      finish(timeoutText);
       return;
     }
     if (code === 0) {
@@ -323,6 +355,7 @@ function runForeground(options: {
       windowsHide: true,
     });
     if (child.pid && options.actor) registerShellPid(child.pid, options.actor);
+    trackChild(child);
 
     let stdout = "";
     let stderr = "";
@@ -333,6 +366,7 @@ function runForeground(options: {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", onAbort);
       if (child.pid) unregisterShellPid(child.pid);
+      closeChildStreams(child);
     };
 
     const finish = (exitCode: number): void => {
