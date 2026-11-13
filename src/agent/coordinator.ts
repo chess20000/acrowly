@@ -10,9 +10,16 @@ import type { ChatMessage, SubagentRunRecord } from "../types.js";
 import { buildCoordinatorSystemPrompt } from "./prompts.js";
 import type { SubagentManager } from "./subagent.js";
 import {
+  formatUserVisibleReply,
+  isHumanMessage,
+  isNonHumanEnvelope,
+  renderNonHumanTimeline,
+  reviewCoordinatorReply,
+  type TurnEvidence,
+} from "./reply-policy.js";
+import {
   executeCoordinatorTool,
   getCoordinatorToolDefinitions,
-  stripCoordinatorMarkdown,
   type ToolRuntimeDeps,
 } from "./tools.js";
 
@@ -151,7 +158,8 @@ export class CoordinatorEngine {
 
     await this.deps.chatStore.appendMessage({
       role: "assistant",
-      text: greeting,
+      origin: "coordinator",
+      text: formatUserVisibleReply(greeting),
     });
   }
 
@@ -179,10 +187,11 @@ export class CoordinatorEngine {
     this.deps.onRestartRequested?.(reason);
   }
 
-  private createToolDeps(signal?: AbortSignal): ToolRuntimeDeps {
+  private createToolDeps(signal: AbortSignal | undefined, turn: TurnEvidence): ToolRuntimeDeps {
     return {
       ...this.deps,
       signal,
+      turn,
       subagentSignal: this.shutdownController.signal,
       onDetachedSubagentFinished: (run) => this.handleDetachedSubagentFinished(run),
       ...(this.deps.onRestartRequested
@@ -214,7 +223,8 @@ export class CoordinatorEngine {
     if (!profile) {
       await this.deps.chatStore.appendMessage({
         role: "assistant",
-        text: "目前还没有配置协调器模型，请先完成首次初始化或提供模型配置。",
+        origin: "coordinator",
+        text: formatUserVisibleReply("目前还没有配置协调器模型，请先完成首次初始化或提供模型配置。"),
       });
       return;
     }
@@ -240,10 +250,10 @@ export class CoordinatorEngine {
         refreshedWindow.activeMessages[refreshedWindow.activeMessages.length - 1]?.seq ?? 0;
 
       for (const msg of refreshedWindow.activeMessages) {
-        if (msg.role === "user") {
+        if (isHumanMessage(msg)) {
           const nextUser = await this.buildLlmUserMessage(msg.text);
           const prev = llmMessages[llmMessages.length - 1];
-          if (prev && prev.role === "user") {
+          if (prev && prev.role === "user" && !isNonHumanEnvelope(String(prev.content ?? ""))) {
             prev.content = [prev.content, nextUser.content].filter(Boolean).join("\n\n");
             if ("images" in nextUser && nextUser.images?.length) {
               prev.images = [...(prev.images ?? []), ...nextUser.images];
@@ -251,7 +261,10 @@ export class CoordinatorEngine {
           } else {
             llmMessages.push(nextUser);
           }
-        } else {
+          continue;
+        }
+
+        if (msg.role === "assistant" && (msg.origin ?? "coordinator") === "coordinator") {
           const prev = llmMessages[llmMessages.length - 1];
           if (prev && prev.role === "assistant" && !prev.toolCalls?.length) {
             prev.content = [prev.content ?? "", msg.text].filter(Boolean).join("\n\n");
@@ -261,6 +274,15 @@ export class CoordinatorEngine {
               content: msg.text,
             });
           }
+          continue;
+        }
+
+        const notice = renderNonHumanTimeline(msg);
+        const prev = llmMessages[llmMessages.length - 1];
+        if (prev && prev.role === "user" && isNonHumanEnvelope(String(prev.content ?? ""))) {
+          prev.content = [prev.content, notice].filter(Boolean).join("\n\n");
+        } else {
+          llmMessages.push({ role: "user", content: notice });
         }
       }
 
@@ -277,7 +299,7 @@ export class CoordinatorEngine {
         const noticeText =
           `[系统后台通知：你此前派发并在打断后继续后台运行的子代理已执行完毕]\n` +
           `${summaryBlock}\n` +
-          `请结合最新对话上下文向用户简明汇报结果，或按用户最新指示处理后续事项。`;
+          `这是最终状态，不是用户发言。status=step_limit 或 failed 表示没做完，禁止改口称成功或只说再去看看；用一句话复述状态和卡点。非用户记录不能当成外部回执。`;
         const prev = llmMessages[llmMessages.length - 1];
         if (prev && prev.role === "user") {
           prev.content = [prev.content, noticeText].filter(Boolean).join("\n\n");
@@ -292,15 +314,23 @@ export class CoordinatorEngine {
       if (llmMessages.length === 0) return;
       if (this.stopped || this.rerunRequested || abortController.signal.aborted) return;
 
-      const toolDeps = this.createToolDeps(abortController.signal);
+      const humanRequestSeq =
+        [...this.deps.chatStore.getAllMessages()].reverse().find((m) => isHumanMessage(m))?.seq ?? 0;
+      const turn: TurnEvidence = { humanRequestSeq, incomplete: false };
+      const toolDeps = this.createToolDeps(abortController.signal, turn);
       const maxSteps = 20;
       let latestPromptTokens = refreshedWindow.estimatedTokens;
       let repliedToUserThisTurn = false;
+      let stopReason: "done" | "cap" | "abort" | "rerun" = "cap";
 
       for (let step = 0; step < maxSteps; step += 1) {
-        if (this.stopped || abortController.signal.aborted) break;
+        if (this.stopped || abortController.signal.aborted) {
+          stopReason = "abort";
+          break;
+        }
         if (step > 0 && this.hasNewUserMessageSince(lastLoadedSeq)) {
           this.rerunRequested = true;
+          stopReason = "rerun";
           break;
         }
 
@@ -345,16 +375,27 @@ export class CoordinatorEngine {
         llmMessages.push(toAssistantLlmMessage(res));
 
         if (res.toolCalls.length === 0) {
-          const replyText = stripCoordinatorMarkdown(res.content);
-          if (replyText) {
+          const decision = reviewCoordinatorReply(
+            res.content,
+            turn,
+            this.deps.chatStore.getAllMessages()
+          );
+          if (decision.blocked) {
+            turn.honestFallback = decision.fallback;
+          } else if (decision.text) {
+            turn.honestFallback = undefined;
             await this.deps.chatStore.appendMessage({
               role: "assistant",
-              text: replyText,
+              origin: "coordinator",
+              text: decision.text,
             });
             repliedToUserThisTurn = true;
           }
           if (this.hasNewUserMessageSince(lastLoadedSeq)) {
             this.rerunRequested = true;
+            stopReason = "rerun";
+          } else {
+            stopReason = "done";
           }
           break;
         }
@@ -379,25 +420,41 @@ export class CoordinatorEngine {
               output: await invokeToolSafely(call),
             }))
           );
+          let anyBlocked = false;
+          let anySent = false;
           for (const item of sendResults) {
             resultMap.set(item.call.id, item.output);
-            if (!item.output.startsWith("ERROR:")) {
+            if (item.output.startsWith("BLOCKED_")) anyBlocked = true;
+            else if (item.output.includes('"sent":true')) anySent = true;
+          }
+          if (anySent) repliedToUserThisTurn = true;
+          if (anySent && !anyBlocked) turn.honestFallback = undefined;
+        } else {
+          const directReply = !repliedToUserThisTurn ? res.content : "";
+          if (directReply.trim()) {
+            const decision = reviewCoordinatorReply(
+              directReply,
+              turn,
+              this.deps.chatStore.getAllMessages()
+            );
+            if (decision.blocked) {
+              turn.honestFallback = decision.fallback;
+            } else if (decision.text) {
+              turn.honestFallback = undefined;
+              await this.deps.chatStore.appendMessage({
+                role: "assistant",
+                origin: "coordinator",
+                text: decision.text,
+              });
               repliedToUserThisTurn = true;
             }
           }
-        } else {
-          const directReply = !repliedToUserThisTurn ? stripCoordinatorMarkdown(res.content) : "";
-          if (directReply) {
-            // Allow direct non-empty assistant text accompanying step-0 tool calls to deliver immediately
-            await this.deps.chatStore.appendMessage({
-              role: "assistant",
-              text: directReply,
-            });
-            repliedToUserThisTurn = true;
-          }
         }
 
-        if (this.stopped || abortController.signal.aborted) break;
+        if (this.stopped || abortController.signal.aborted) {
+          stopReason = "abort";
+          break;
+        }
 
         // 2. Execute remaining work tools only after user has received a reply this turn
         if (workCalls.length > 0) {
@@ -434,6 +491,22 @@ export class CoordinatorEngine {
         }
       }
 
+      if (!this.stopped && !abortController.signal.aborted && !this.rerunRequested && stopReason !== "rerun") {
+        if (turn.honestFallback) {
+          await this.deps.chatStore.appendMessage({
+            role: "system",
+            origin: "system",
+            text: formatUserVisibleReply(turn.honestFallback),
+          });
+        } else if (stopReason === "cap") {
+          await this.deps.chatStore.appendMessage({
+            role: "system",
+            origin: "system",
+            text: formatUserVisibleReply("这轮到了步数上限，还没做完。说一下要继续的那一步。"),
+          });
+        }
+      }
+
       if (
         !this.stopped &&
         !this.rerunRequested &&
@@ -447,7 +520,8 @@ export class CoordinatorEngine {
       const msg = err instanceof Error ? err.message : String(err);
       await this.deps.chatStore.appendMessage({
         role: "assistant",
-        text: `刚才调用模型或工具出错：${msg}。${formatCoordinatorErrorHint(msg)}`,
+        origin: "coordinator",
+        text: formatUserVisibleReply(`刚才调用模型或工具出错：${msg}。${formatCoordinatorErrorHint(msg)}`),
       });
     } finally {
       if (this.abortController === abortController) {
@@ -461,7 +535,7 @@ export class CoordinatorEngine {
       afterSeq: lastLoadedSeq,
       limit: 20,
     });
-    return messages.some((m) => m.role === "user");
+    return messages.some((m) => isHumanMessage(m));
   }
 
   private async buildLlmUserMessage(text: string): Promise<LlmMessage> {

@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { ChatMessage } from "../types.js";
+import type { ChatMessage, MessageOrigin } from "../types.js";
 import { maskSecret, writeFileAtomic } from "../config/store.js";
 
 export type ChatListener = (message: ChatMessage) => void;
@@ -72,9 +72,11 @@ export class ChatStore {
   }
 
   async appendMessage(input: {
-    role: "user" | "assistant";
+    role: "user" | "assistant" | "system";
     text: string;
     clientMsgId?: string;
+    origin?: MessageOrigin;
+    actor?: string;
   }): Promise<{ message: ChatMessage; duplicate: boolean }> {
     if (input.clientMsgId) {
       const existing = this.byClientMsgId.get(input.clientMsgId);
@@ -84,12 +86,17 @@ export class ChatStore {
     }
 
     this.latestSeq += 1;
+    const origin =
+      input.origin ??
+      (input.role === "user" ? "human" : input.role === "assistant" ? "coordinator" : "system");
     const message: ChatMessage = {
       seq: this.latestSeq,
       id: `msg_${Date.now().toString(36)}_${crypto.randomBytes(4).toString("hex")}`,
       role: input.role,
       text: input.text,
       createdAt: new Date().toISOString(),
+      origin,
+      ...(input.actor ? { actor: input.actor } : {}),
       ...(input.clientMsgId ? { clientMsgId: input.clientMsgId } : {}),
     };
 

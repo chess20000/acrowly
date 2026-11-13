@@ -90,8 +90,11 @@ Native clients (iOS App, `acl chat`) pass `Authorization: Bearer <token>` on sub
 }
 ```
 - `seq`: Strictly monotonically increasing integer (`1, 2, 3, ...`) across the single continuous conversation timeline.
-- `role`: `"user"` | `"assistant"`.
+- `role`: `"user"` | `"assistant"` | `"system"`.
+- `origin`: `"human"` | `"coordinator"` | `"subagent"` | `"extension"` | `"tool"` | `"system"`. Who produced the row. Legacy rows may omit it (`user` means human, `assistant` means coordinator).
+- `actor`: optional label (subagent name, extension tool, background job).
 - `text`: Plain / Markdown text. Images appear as `![alt](/api/files/<id>/<name>)` and downloadable files as `[name](/api/files/<id>/<name>)`.
+- Render `origin !== "human"` (and `role: "system"`) as a system/agent note. Never show those rows as the human user. A loopback post made by a subagent, extension, or tool is stored as `role: "system"` with that origin, and does not start a user turn.
 
 ### `GET /api/chat/messages`
 Fetch chat history from the single continuous timeline.

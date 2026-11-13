@@ -1,4 +1,7 @@
 import fs from "node:fs/promises";
+import { installFetchActorHeader } from "./agent/actor.js";
+import { stopTrackedShells } from "./agent/shell-runner.js";
+import { formatUserVisibleReply } from "./agent/reply-policy.js";
 import { CoordinatorEngine } from "./agent/coordinator.js";
 import { SubagentManager } from "./agent/subagent.js";
 import { ConfigStore, resolveRuntimePaths } from "./config/store.js";
@@ -108,6 +111,8 @@ export async function createAcrowlyDaemon(
     tunnelClient,
     start: async () => {
       const addr = await httpServer.start();
+      process.env.ACROWLY_LOCAL_ORIGIN = `http://127.0.0.1:${addr.port}`;
+      installFetchActorHeader();
       tunnelClient.start();
       coordinator.startBackgroundLoops();
 
@@ -121,7 +126,10 @@ export async function createAcrowlyDaemon(
           const reasonNote = parsed.reason ? `（${parsed.reason}）` : "";
           await chatStore.appendMessage({
             role: "assistant",
-            text: `服务已重启完成（PID ${process.pid}），新代码已生效${reasonNote}。`,
+            origin: "coordinator",
+            text: formatUserVisibleReply(
+              `服务已重启完成（PID ${process.pid}），新代码已生效${reasonNote}。`
+            ),
           });
         }
       } catch {
@@ -134,6 +142,7 @@ export async function createAcrowlyDaemon(
       return addr;
     },
     stop: async () => {
+      stopTrackedShells();
       await coordinator.stop();
       tunnelClient.stop();
       await httpServer.stop();

@@ -195,7 +195,20 @@ export async function startPlainTerminalChat(options: TerminalChatOptions): Prom
 }
 
 function printMessage(msg: ChatMessage): void {
-  const tag = msg.role === "assistant" ? "[协调器]" : "[你]";
+  const origin = msg.origin ?? (msg.role === "user" ? "human" : msg.role === "assistant" ? "coordinator" : "system");
+  const actor = msg.actor ? ` ${msg.actor}` : "";
+  const tag =
+    origin === "human"
+      ? "[你]"
+      : origin === "coordinator"
+        ? "[协调器]"
+        : origin === "subagent"
+          ? `[子代理${actor}]`
+          : origin === "extension"
+            ? `[扩展${actor}]`
+            : origin === "tool"
+              ? "[工具]"
+              : "[系统]";
   output.write(`\n${tag}\n${msg.text}\n\n`);
 }
 

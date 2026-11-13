@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
+import { actorFromToken, attributeLoopbackClient } from "../agent/actor.js";
 import type { CoordinatorEngine } from "../agent/coordinator.js";
 import type { ConfigStore } from "../config/store.js";
 import {
@@ -8,7 +9,7 @@ import {
   parseMultipartFormData,
 } from "../storage/attachment-store.js";
 import type { ChatStore } from "../storage/chat-store.js";
-import type { StoredFileMeta } from "../types.js";
+import type { ChatMessage, StoredFileMeta } from "../types.js";
 import {
   AuthChallengeStore,
   AuthRateLimiter,
@@ -43,6 +44,26 @@ interface UploadedFileResponse {
   size: number;
   url: string;
   markdown: string;
+}
+
+function toPublicChatMessage(message: ChatMessage): {
+  seq: number;
+  id: string;
+  role: ChatMessage["role"];
+  text: string;
+  createdAt: string;
+  origin?: ChatMessage["origin"];
+  actor?: string;
+} {
+  return {
+    seq: message.seq,
+    id: message.id,
+    role: message.role,
+    text: message.text,
+    createdAt: message.createdAt,
+    ...(message.origin ? { origin: message.origin } : {}),
+    ...(message.actor ? { actor: message.actor } : {}),
+  };
 }
 
 function toUploadedFileResponse(
@@ -112,6 +133,7 @@ export interface NormalizedRequest {
   body: Buffer;
   isRemote: boolean;
   clientIp: string;
+  clientPort?: number;
 }
 
 const NO_WEBUI_PLACEHOLDER_HTML = `<!doctype html>
@@ -249,6 +271,7 @@ export class AcrowlyHttpServer {
           body: Buffer.concat(chunks),
           isRemote,
           clientIp,
+          clientPort: req.socket.remotePort,
         },
         sink
       );
@@ -426,13 +449,7 @@ export class AcrowlyHttpServer {
           sink,
           200,
           {
-            messages: result.messages.map((m) => ({
-              seq: m.seq,
-              id: m.id,
-              role: m.role,
-              text: m.text,
-              createdAt: m.createdAt,
-            })),
+            messages: result.messages.map((m) => toPublicChatMessage(m)),
             latestSeq: result.latestSeq,
           },
           req.headers
@@ -503,13 +520,28 @@ export class AcrowlyHttpServer {
         }
         const combinedText = textParts.join("\n");
 
-        const { message, duplicate } = await this.deps.chatStore.appendMessage({
-          role: "user",
-          text: combinedText,
-          clientMsgId,
-        });
+        const actorHeader = req.headers["x-acrowly-actor"];
+        const actorToken = (Array.isArray(actorHeader) ? actorHeader[0] : actorHeader)?.trim();
+        const actor =
+          actorFromToken(actorToken) ??
+          (!req.isRemote ? attributeLoopbackClient(req.clientPort) : undefined);
 
-        if (!duplicate) {
+        const { message, duplicate } = actor
+          ? await this.deps.chatStore.appendMessage({
+              role: "system",
+              origin: actor.kind,
+              actor: actor.label,
+              text: combinedText,
+              clientMsgId,
+            })
+          : await this.deps.chatStore.appendMessage({
+              role: "user",
+              origin: "human",
+              text: combinedText,
+              clientMsgId,
+            });
+
+        if (!duplicate && !actor) {
           this.deps.coordinator.notifyUserMessage();
         }
 
@@ -517,13 +549,7 @@ export class AcrowlyHttpServer {
           sink,
           duplicate ? 200 : 202,
           {
-            message: {
-              seq: message.seq,
-              id: message.id,
-              role: message.role,
-              text: message.text,
-              createdAt: message.createdAt,
-            },
+            message: toPublicChatMessage(message),
             duplicate,
             ...(savedAttachments.length > 0 ? { attachments: savedAttachments } : {}),
           },
@@ -554,23 +580,10 @@ export class AcrowlyHttpServer {
         sink.write(": connected\n\n");
 
         let lastSentSeq = startSeq;
-        const sendSseMessage = (msg: {
-          seq: number;
-          id: string;
-          role: "user" | "assistant";
-          text: string;
-          createdAt: string;
-        }) => {
+        const sendSseMessage = (msg: ChatMessage) => {
           if (msg.seq <= lastSentSeq) return;
           lastSentSeq = msg.seq;
-          const payload = JSON.stringify({
-            seq: msg.seq,
-            id: msg.id,
-            role: msg.role,
-            text: msg.text,
-            createdAt: msg.createdAt,
-          });
-          sink.write(`id: ${msg.seq}\nevent: message\ndata: ${payload}\n\n`);
+          sink.write(`id: ${msg.seq}\nevent: message\ndata: ${JSON.stringify(toPublicChatMessage(msg))}\n\n`);
         };
 
         // Replay missed messages first

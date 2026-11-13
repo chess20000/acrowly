@@ -402,7 +402,7 @@ test("DeepSeek thinking-mode preserves reasoning_content (including empty string
                 message: {
                   role: "assistant",
                   reasoning_content: "Everything succeeded without HTTP 400.",
-                  content: `最终完成：${String(lastMsg.content ?? "")}`,
+                  content: "最终完成：子代理核查完成：环境就绪。",
                 },
               },
             ],
