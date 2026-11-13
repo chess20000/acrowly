@@ -1,0 +1,19 @@
+{
+  "name": "acrowly-site",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "cf dev",
+    "build": "cf build",
+    "deploy": "cf deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "beta",
+    "@types/node": "^22.15.0",
+    "cf": "^0.15.0",
+    "typescript": "^5.8.3",
+    "vite": "^7.3.1"
+  }
+}
