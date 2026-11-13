@@ -1,4 +1,4 @@
-import { defineConfig, triggers } from "cf/config";
+import { defineConfig } from "cf/config";
 import * as entrypoint from "./src/index.ts" with { type: "cf-worker" };
 
 export default defineConfig({
@@ -8,12 +8,7 @@ export default defineConfig({
     entrypoint,
     compatibilityDate: "2026-11-13",
     compatibilityFlags: ["nodejs_compat"],
-    triggers: [
-      triggers.fetch({
-        pattern: "acrowly.com/*",
-        zone: "acrowly.com",
-      }),
-    ],
+    domains: ["acrowly.com"],
     observability: {
       enabled: true,
       logs: {
