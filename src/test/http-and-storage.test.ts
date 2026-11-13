@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { ConfigStore, resolveRuntimePaths } from "../config/store.js";
+import { ConfigStore, getDefaultModelForProvider, resolveRuntimePaths } from "../config/store.js";
 import { SnapshotManager } from "../extensions/snapshot.js";
 import { createAcrowlyDaemon } from "../runtime.js";
 import {
@@ -269,6 +269,56 @@ test("Pure Chat HTTP API, SSE sync, file upload/download, auth, secret redaction
       });
       assert.equal(authRes.status, 200);
 
+      // Live SSE stream with empty missed backlog must stay subscribed on GET requests
+      // and flush headers immediately without waiting for the 20s heartbeat ping.
+      const withTimeout = async <T>(promise: Promise<T>, label: string): Promise<T> => {
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          return await Promise.race([
+            promise,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 3000);
+            }),
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
+
+      const latestSeq = daemon.chatStore.getAllMessages().at(-1)?.seq ?? 0;
+      const sseController = new AbortController();
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      try {
+        const sseRes = await withTimeout(
+          fetch(`${base}/api/chat/stream?after_seq=${latestSeq}`, {
+            headers: { Authorization: `Bearer ${verifyData.token}` },
+            signal: sseController.signal,
+          }),
+          "SSE initial headers",
+        );
+        assert.equal(sseRes.status, 200);
+        reader = sseRes.body!.getReader();
+        const decoder = new TextDecoder();
+        let sseBuffer = "";
+
+        const readUntil = async (needle: string): Promise<void> => {
+          while (!sseBuffer.includes(needle)) {
+            const chunk = await withTimeout(reader!.read(), `SSE chunk ${JSON.stringify(needle)}`);
+            if (chunk.done) {
+              throw new Error(`SSE stream closed prematurely before ${JSON.stringify(needle)}`);
+            }
+            sseBuffer += decoder.decode(chunk.value, { stream: true });
+          }
+        };
+
+        await readUntil(": connected");
+        await daemon.chatStore.appendMessage({ role: "assistant", text: "live sse reply" });
+        await readUntil("live sse reply");
+      } finally {
+        sseController.abort();
+        await reader?.cancel().catch(() => {});
+      }
+
       // Revoking key blocks subsequent challenges
       const removed = await daemon.configStore.removeAuthorizedPublicKey(clientKey.fingerprint);
       assert.equal(removed, true);
@@ -335,4 +385,8 @@ test("SnapshotManager backs up and restores webui and extensions cleanly", async
     assert.equal(await fs.readFile(path.join(paths.webuiDir, "index.html"), "utf8"), "<h1>v1</h1>");
     assert.equal(await fs.readFile(path.join(paths.extensionsDir, "hello.mjs"), "utf8"), "export default {}");
   });
+});
+
+test("getDefaultModelForProvider returns deepseek-flash for deepseek", () => {
+  assert.equal(getDefaultModelForProvider("deepseek"), "deepseek-flash");
 });

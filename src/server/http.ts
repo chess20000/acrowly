@@ -164,7 +164,7 @@ export class AcrowlyHttpServer {
           }
         },
         onClose: (cb) => {
-          req.on("close", cb);
+          res.once("close", cb);
         },
       };
 
@@ -435,6 +435,8 @@ export class AcrowlyHttpServer {
           Connection: "keep-alive",
           "X-Accel-Buffering": "no",
         });
+        // Flush headers immediately so fetch() resolves before any message/ping arrives.
+        sink.write(": connected\n\n");
 
         let lastSentSeq = startSeq;
         const sendSseMessage = (msg: {

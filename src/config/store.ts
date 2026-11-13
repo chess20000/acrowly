@@ -56,7 +56,7 @@ export function getDefaultModelForProvider(provider: ProviderKind): string {
     case "anthropic":
       return "claude-sonnet-4-5";
     case "deepseek":
-      return "deepseek-chat";
+      return "deepseek-flash";
     case "openrouter":
       return "anthropic/claude-sonnet-4.5";
     case "ollama":

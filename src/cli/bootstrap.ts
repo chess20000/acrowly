@@ -9,10 +9,10 @@ import { ensureClientEd25519KeyPair } from "../server/ed25519.js";
 import type { ProviderKind } from "../types.js";
 
 const PROVIDER_CHOICES: Array<{ index: string; kind: ProviderKind; label: string }> = [
-  { index: "1", kind: "openai", label: "OpenAI" },
-  { index: "2", kind: "gemini", label: "Google Gemini" },
-  { index: "3", kind: "anthropic", label: "Anthropic Claude" },
-  { index: "4", kind: "deepseek", label: "DeepSeek" },
+  { index: "1", kind: "deepseek", label: "DeepSeek" },
+  { index: "2", kind: "openai", label: "OpenAI" },
+  { index: "3", kind: "gemini", label: "Google Gemini" },
+  { index: "4", kind: "anthropic", label: "Anthropic Claude" },
   { index: "5", kind: "openrouter", label: "OpenRouter" },
   { index: "6", kind: "ollama", label: "Ollama (本地开源模型)" },
   { index: "7", kind: "custom", label: "自定义 OpenAI 兼容接口" },
