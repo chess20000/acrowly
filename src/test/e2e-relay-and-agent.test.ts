@@ -200,7 +200,7 @@ test("End-to-end: acrowly.com Relay tunnel + Coordinator delegates WebUI & live 
                 choices: [
                   {
                     message: {
-                      content: null,
+                      content: "好，我这就调用 ext_greet_user 测试一下。",
                       tool_calls: [
                         {
                           id: "coord_call_ext",

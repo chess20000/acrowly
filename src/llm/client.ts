@@ -85,6 +85,9 @@ export class LlmClient {
           role: "assistant",
           content: msg.content || (msg.toolCalls?.length ? null : ""),
         };
+        if (msg.reasoningContent !== undefined) {
+          entry.reasoning_content = msg.reasoningContent;
+        }
         if (msg.toolCalls && msg.toolCalls.length > 0) {
           entry.tool_calls = msg.toolCalls.map((tc) => ({
             id: tc.id,
@@ -150,6 +153,7 @@ export class LlmClient {
       choices?: Array<{
         message?: {
           content?: string | null;
+          reasoning_content?: string | null;
           tool_calls?: Array<{
             id?: string;
             function?: { name?: string; arguments?: string };
@@ -168,6 +172,9 @@ export class LlmClient {
 
     return {
       content: choiceMsg?.content ?? "",
+      ...(typeof choiceMsg?.reasoning_content === "string"
+        ? { reasoningContent: choiceMsg.reasoning_content }
+        : {}),
       toolCalls,
       promptTokens: data.usage?.prompt_tokens,
       completionTokens: data.usage?.completion_tokens,

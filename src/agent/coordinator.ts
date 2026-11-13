@@ -2,7 +2,7 @@ import type { ConfigStore } from "../config/store.js";
 import type { ExtensionLoader } from "../extensions/loader.js";
 import type { SnapshotManager } from "../extensions/snapshot.js";
 import type { LlmClient } from "../llm/client.js";
-import type { LlmImagePart, LlmMessage } from "../llm/types.js";
+import { toAssistantLlmMessage, type LlmImagePart, type LlmMessage } from "../llm/types.js";
 import type { AttachmentStore } from "../storage/attachment-store.js";
 import type { ChatStore } from "../storage/chat-store.js";
 import { ContextStore, estimateTokens } from "../storage/context-store.js";
@@ -23,6 +23,38 @@ const SUPPORTED_VISION_MIMES = new Set([
 ]);
 
 const FILE_REF_REGEX = /\/api\/files\/(file_[a-z0-9_]+)/gi;
+
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    return Promise.reject(new Error("Aborted by new user message"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(new Error("Aborted by new user message"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      }
+    );
+  });
+}
+
+function formatCoordinatorErrorHint(msg: string): string {
+  if (/\b(401|403)\b|invalid_api_key|authentication|unauthorized/i.test(msg)) {
+    return "请检查模型 API Key 或账号权限后重试。";
+  }
+  if (/\b429\b|quota|rate_limit|insufficient_balance/i.test(msg)) {
+    return "看起来触发了额度或限流限制，稍后再试或切换其他模型。";
+  }
+  return "可以告诉我你想怎么继续，或检查下当前模型请求参数与接口兼容性。";
+}
 
 export class CoordinatorEngine {
   private running = false;
@@ -89,6 +121,8 @@ export class CoordinatorEngine {
     this.lastActivityAt = Date.now();
     if (this.running) {
       this.rerunRequested = true;
+      // Interrupt the active turn immediately so Coordinator switches to the latest user message
+      this.abortController?.abort(new Error("Interrupted by new user message"));
       return;
     }
     this.activeRunPromise = this.runLoop().finally(() => {
@@ -116,9 +150,10 @@ export class CoordinatorEngine {
     });
   }
 
-  private createToolDeps(): ToolRuntimeDeps {
+  private createToolDeps(signal?: AbortSignal): ToolRuntimeDeps {
     return {
       ...this.deps,
+      signal,
       onTriggerCompaction: () => this.compactContext("manual"),
     };
   }
@@ -150,47 +185,64 @@ export class CoordinatorEngine {
       return;
     }
 
-    const allMessages = this.deps.chatStore.getAllMessages();
-    const windowInfo = this.deps.contextStore.getPromptWindow(allMessages);
-
-    if (windowInfo.estimatedTokens >= config.context.compactionTokenThreshold) {
-      await this.compactContext("threshold_pre");
-    }
-
-    const refreshedWindow = this.deps.contextStore.getPromptWindow(
-      this.deps.chatStore.getAllMessages()
-    );
-
-    const llmMessages: LlmMessage[] = [];
-    let lastLoadedSeq = refreshedWindow.activeMessages[refreshedWindow.activeMessages.length - 1]?.seq ?? 0;
-
-    for (const msg of refreshedWindow.activeMessages) {
-      if (msg.role === "user") {
-        llmMessages.push(await this.buildLlmUserMessage(msg.text));
-      } else {
-        llmMessages.push({
-          role: "assistant",
-          content: msg.text,
-        });
-      }
-    }
-
-    if (llmMessages.length === 0) return;
-
-    const toolDeps = this.createToolDeps();
-    const maxSteps = 20;
     const abortController = new AbortController();
     this.abortController = abortController;
 
+    const allMessages = this.deps.chatStore.getAllMessages();
+    const windowInfo = this.deps.contextStore.getPromptWindow(allMessages);
+
     try {
+      if (windowInfo.estimatedTokens >= config.context.compactionTokenThreshold) {
+        await this.compactContext("threshold_pre");
+      }
+      if (this.stopped || this.rerunRequested || abortController.signal.aborted) return;
+
+      const refreshedWindow = this.deps.contextStore.getPromptWindow(
+        this.deps.chatStore.getAllMessages()
+      );
+
+      const llmMessages: LlmMessage[] = [];
+      let lastLoadedSeq =
+        refreshedWindow.activeMessages[refreshedWindow.activeMessages.length - 1]?.seq ?? 0;
+
+      for (const msg of refreshedWindow.activeMessages) {
+        if (msg.role === "user") {
+          const nextUser = await this.buildLlmUserMessage(msg.text);
+          const prev = llmMessages[llmMessages.length - 1];
+          if (prev && prev.role === "user") {
+            prev.content = [prev.content, nextUser.content].filter(Boolean).join("\n\n");
+            if ("images" in nextUser && nextUser.images?.length) {
+              prev.images = [...(prev.images ?? []), ...nextUser.images];
+            }
+          } else {
+            llmMessages.push(nextUser);
+          }
+        } else {
+          const prev = llmMessages[llmMessages.length - 1];
+          if (prev && prev.role === "assistant" && !prev.toolCalls?.length) {
+            prev.content = [prev.content ?? "", msg.text].filter(Boolean).join("\n\n");
+          } else {
+            llmMessages.push({
+              role: "assistant",
+              content: msg.text,
+            });
+          }
+        }
+      }
+
+      if (llmMessages.length === 0) return;
+      if (this.stopped || this.rerunRequested || abortController.signal.aborted) return;
+
+      const toolDeps = this.createToolDeps(abortController.signal);
+      const maxSteps = 20;
       let latestPromptTokens = refreshedWindow.estimatedTokens;
+      let repliedToUserThisTurn = false;
 
       for (let step = 0; step < maxSteps; step += 1) {
         if (this.stopped || abortController.signal.aborted) break;
-        // Pull in any user messages sent mid-turn (steering)
-        const steered = await this.drainMidTurnMessages(lastLoadedSeq, llmMessages);
-        if (steered.newLastSeq > lastLoadedSeq) {
-          lastLoadedSeq = steered.newLastSeq;
+        if (step > 0 && this.hasNewUserMessageSince(lastLoadedSeq)) {
+          this.rerunRequested = true;
+          break;
         }
 
         const currentConfig = this.deps.configStore.getConfig();
@@ -230,11 +282,7 @@ export class CoordinatorEngine {
           await this.deps.contextStore.recordPromptTokenEstimate(fallbackEstimate);
         }
 
-        llmMessages.push({
-          role: "assistant",
-          content: res.content,
-          ...(res.toolCalls.length > 0 ? { toolCalls: res.toolCalls } : {}),
-        });
+        llmMessages.push(toAssistantLlmMessage(res));
 
         if (res.toolCalls.length === 0) {
           const replyText = res.content.trim();
@@ -243,41 +291,92 @@ export class CoordinatorEngine {
               role: "assistant",
               text: replyText,
             });
+            repliedToUserThisTurn = true;
           }
-          // Check if a user message arrived while we were awaiting final LLM response
-          const trailing = this.deps.chatStore.getMessages({ afterSeq: lastLoadedSeq, limit: 20 });
-          if (trailing.messages.some((m) => m.role === "user")) {
+          if (this.hasNewUserMessageSince(lastLoadedSeq)) {
             this.rerunRequested = true;
           }
           break;
         }
 
-        // Execute tool calls concurrently when multiple are issued (e.g. parallel subagents)
-        const results = await Promise.all(
-          res.toolCalls.map(async (call) => {
-            try {
-              const output = await executeCoordinatorTool(call.name, call.arguments, toolDeps);
-              return { call, output };
-            } catch (err) {
-              return {
-                call,
-                output: `ERROR: ${err instanceof Error ? err.message : String(err)}`,
-              };
-            }
-          })
-        );
+        const sendCalls = res.toolCalls.filter((c) => c.name === "send_chat_message");
+        const workCalls = res.toolCalls.filter((c) => c.name !== "send_chat_message");
+        const resultMap = new Map<string, string>();
 
-        for (const item of results) {
+        const invokeToolSafely = async (call: (typeof res.toolCalls)[number]): Promise<string> => {
+          try {
+            return await executeCoordinatorTool(call.name, call.arguments, toolDeps);
+          } catch (err) {
+            return `ERROR: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        };
+
+        // 1. Always deliver immediate replies first before starting work tools
+        if (sendCalls.length > 0) {
+          const sendResults = await Promise.all(
+            sendCalls.map(async (call) => ({
+              call,
+              output: await invokeToolSafely(call),
+            }))
+          );
+          for (const item of sendResults) {
+            resultMap.set(item.call.id, item.output);
+            if (!item.output.startsWith("ERROR:")) {
+              repliedToUserThisTurn = true;
+            }
+          }
+        } else if (!repliedToUserThisTurn && res.content.trim()) {
+          // Allow direct non-empty assistant text accompanying step-0 tool calls to deliver immediately
+          await this.deps.chatStore.appendMessage({
+            role: "assistant",
+            text: res.content.trim(),
+          });
+          repliedToUserThisTurn = true;
+        }
+
+        if (this.stopped || abortController.signal.aborted) break;
+
+        // 2. Execute remaining work tools only after user has received a reply this turn
+        if (workCalls.length > 0) {
+          if (!repliedToUserThisTurn) {
+            for (const call of workCalls) {
+              resultMap.set(
+                call.id,
+                "BLOCKED_REPLY_FIRST: 本轮尚未向用户发送任何首次回复，请先调用 send_chat_message（或输出文本内容）向用户回复一句确认或说明，然后再开始执行工作工具。"
+              );
+            }
+          } else {
+            const workResults = await raceAbort(
+              Promise.all(
+                workCalls.map(async (call) => ({
+                  call,
+                  output: await invokeToolSafely(call),
+                }))
+              ),
+              abortController.signal
+            );
+            for (const item of workResults) {
+              resultMap.set(item.call.id, item.output);
+            }
+          }
+        }
+
+        for (const call of res.toolCalls) {
           llmMessages.push({
             role: "tool",
-            toolCallId: item.call.id,
-            toolName: item.call.name,
-            content: item.output,
+            toolCallId: call.id,
+            toolName: call.name,
+            content: resultMap.get(call.id) ?? "ERROR: missing tool execution result",
           });
         }
       }
 
-      if (!this.stopped && latestPromptTokens >= this.deps.configStore.getConfig().context.compactionTokenThreshold) {
+      if (
+        !this.stopped &&
+        !this.rerunRequested &&
+        !abortController.signal.aborted &&
+        latestPromptTokens >= this.deps.configStore.getConfig().context.compactionTokenThreshold
+      ) {
         await this.compactContext("threshold_post");
       }
     } catch (err) {
@@ -285,7 +384,7 @@ export class CoordinatorEngine {
       const msg = err instanceof Error ? err.message : String(err);
       await this.deps.chatStore.appendMessage({
         role: "assistant",
-        text: `刚才调用模型或工具时出了点岔子：\`${msg}\`。你可以检查一下 API Key、额度或者网络连通性，修正后直接再跟我说一声就行。`,
+        text: `刚才调用模型或工具时出了点岔子：\`${msg}\`。${formatCoordinatorErrorHint(msg)}`,
       });
     } finally {
       if (this.abortController === abortController) {
@@ -294,22 +393,12 @@ export class CoordinatorEngine {
     }
   }
 
-  private async drainMidTurnMessages(
-    lastLoadedSeq: number,
-    llmMessages: LlmMessage[]
-  ): Promise<{ newLastSeq: number }> {
+  private hasNewUserMessageSince(lastLoadedSeq: number): boolean {
     const { messages } = this.deps.chatStore.getMessages({
       afterSeq: lastLoadedSeq,
-      limit: 50,
+      limit: 20,
     });
-    let maxSeq = lastLoadedSeq;
-    for (const msg of messages) {
-      if (msg.seq > maxSeq) maxSeq = msg.seq;
-      if (msg.role === "user") {
-        llmMessages.push(await this.buildLlmUserMessage(msg.text));
-      }
-    }
-    return { newLastSeq: maxSeq };
+    return messages.some((m) => m.role === "user");
   }
 
   private async buildLlmUserMessage(text: string): Promise<LlmMessage> {

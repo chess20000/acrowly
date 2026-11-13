@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import type { ModelProfile, SubagentRunRecord } from "../types.js";
 import type { LlmClient } from "../llm/client.js";
-import type { LlmMessage, ToolDefinition } from "../llm/types.js";
+import { toAssistantLlmMessage, type LlmMessage, type ToolDefinition } from "../llm/types.js";
 import { buildSubagentSystemPrompt } from "./prompts.js";
 
 export interface SubagentToolExecutor {
@@ -27,6 +27,7 @@ export class SubagentManager {
     profile: ModelProfile;
     tools: SubagentToolExecutor;
     maxSteps?: number;
+    signal?: AbortSignal;
   }): Promise<SubagentRunRecord> {
     const id = `sub_${Date.now().toString(36)}_${crypto.randomBytes(3).toString("hex")}`;
     const record: SubagentRunRecord = {
@@ -43,21 +44,29 @@ export class SubagentManager {
     const messages: LlmMessage[] = [{ role: "user", content: input.task }];
     const maxSteps = input.maxSteps ?? 25;
 
+    const markInterrupted = (): SubagentRunRecord => {
+      record.status = "failed";
+      record.finishedAt = new Date().toISOString();
+      record.error = "Interrupted";
+      return record;
+    };
+
     try {
       for (let step = 0; step < maxSteps; step += 1) {
+        if (input.signal?.aborted) {
+          return markInterrupted();
+        }
+
         const res = await this.llm.chat({
           profile: input.profile,
           systemPrompt,
           messages,
           tools: input.tools.definitions,
           temperature: 0.2,
+          signal: input.signal,
         });
 
-        messages.push({
-          role: "assistant",
-          content: res.content,
-          ...(res.toolCalls.length > 0 ? { toolCalls: res.toolCalls } : {}),
-        });
+        messages.push(toAssistantLlmMessage(res));
 
         if (res.toolCalls.length === 0) {
           record.status = "completed";
@@ -67,10 +76,16 @@ export class SubagentManager {
         }
 
         for (const call of res.toolCalls) {
+          if (input.signal?.aborted) {
+            return markInterrupted();
+          }
           let toolOutput: string;
           try {
             toolOutput = await input.tools.execute(call.name, call.arguments);
           } catch (err) {
+            if (input.signal?.aborted) {
+              return markInterrupted();
+            }
             toolOutput = `ERROR: ${err instanceof Error ? err.message : String(err)}`;
           }
           messages.push({
@@ -88,6 +103,9 @@ export class SubagentManager {
         "Reached maximum subagent execution steps; inspect modified files or logs for partial results.";
       return record;
     } catch (err) {
+      if (input.signal?.aborted) {
+        return markInterrupted();
+      }
       record.status = "failed";
       record.finishedAt = new Date().toISOString();
       record.error = err instanceof Error ? err.message : String(err);

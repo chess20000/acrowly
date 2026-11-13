@@ -26,6 +26,7 @@ export type LlmMessage =
   | {
       role: "assistant";
       content: string;
+      reasoningContent?: string;
       toolCalls?: ToolCall[];
     }
   | {
@@ -37,7 +38,19 @@ export type LlmMessage =
 
 export interface LlmResponse {
   content: string;
+  reasoningContent?: string;
   toolCalls: ToolCall[];
   promptTokens?: number;
   completionTokens?: number;
+}
+
+export function toAssistantLlmMessage(
+  res: Pick<LlmResponse, "content" | "reasoningContent" | "toolCalls">
+): LlmMessage {
+  return {
+    role: "assistant",
+    content: res.content,
+    ...(res.reasoningContent !== undefined ? { reasoningContent: res.reasoningContent } : {}),
+    ...(res.toolCalls.length > 0 ? { toolCalls: res.toolCalls } : {}),
+  };
 }

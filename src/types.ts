@@ -125,6 +125,7 @@ export interface ExtensionExecutionContext {
   workspaceDir: string;
   dataDir: string;
   webuiDir: string;
+  signal?: AbortSignal;
   publishFile: (localPath: string, displayName?: string) => Promise<{
     id: string;
     kind: "image" | "file";

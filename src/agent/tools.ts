@@ -22,6 +22,7 @@ export interface ToolRuntimeDeps {
   extensionLoader: ExtensionLoader;
   snapshotManager: SnapshotManager;
   subagentManager: SubagentManager;
+  signal?: AbortSignal;
   onTriggerCompaction: () => Promise<string>;
   onRelayConfigUpdated?: () => void;
   getRelayConnected?: () => boolean;
@@ -346,6 +347,7 @@ export function createExtensionContext(deps: ToolRuntimeDeps): ExtensionExecutio
     workspaceDir: paths.rootDir,
     dataDir: paths.dataDir,
     webuiDir: paths.webuiDir,
+    ...(deps.signal ? { signal: deps.signal } : {}),
     publishFile: async (localPath, displayName) => {
       const saved = await deps.attachmentStore.importLocalFile(localPath, displayName);
       return {
@@ -385,6 +387,7 @@ async function executeHostTool(
           timeout: timeoutMs,
           maxBuffer: 4 * 1024 * 1024,
           shell: process.platform === "win32" ? "powershell.exe" : "/bin/sh",
+          signal: deps.signal,
         });
         const combined = [
           stdout ? `STDOUT:\n${stdout}` : "",
@@ -394,6 +397,9 @@ async function executeHostTool(
           .join("\n");
         return (combined || "(Command exited with code 0, no output.)").slice(0, 16_000);
       } catch (err) {
+        if (deps.signal?.aborted) {
+          throw err;
+        }
         const e = err as { code?: number; stdout?: string; stderr?: string; message?: string };
         return `EXIT ${e.code ?? 1}\n${e.message ?? ""}\nSTDOUT:\n${e.stdout ?? ""}\nSTDERR:\n${e.stderr ?? ""}`.slice(
           0,
@@ -560,6 +566,7 @@ export async function executeCoordinatorTool(
         task,
         profile,
         tools: buildSubagentToolExecutor(deps),
+        signal: deps.signal,
       });
       return JSON.stringify(run, null, 2);
     }
